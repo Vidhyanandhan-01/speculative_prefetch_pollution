@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -41,12 +42,25 @@
  * Phase 2 instrumentation (see instrumentation/branch_log.h): every issued
  * prefetch's branch_log sequence number is recorded per source PC; the next
  * real occurrence of that PC pops the oldest pending sequence number and
- * measures (a) how many conditional/other branches retired in between --
- * an empirical gating_branches sample -- and (b) whether any of them
- * mispredicted -- the "this prefetch would have been wasted on a wrong
- * path" proxy, aggregated per PC for an empirical waste-concentration
- * (alpha) measurement. Replaces the two swept assumptions in
- * analytical_model/model.py with real data from this workload.
+ * measures (a) how many times this PC's IDENTIFIED gating branch retired in
+ * between -- an empirical gating_branches sample -- and (b) whether any of
+ * those specific occurrences mispredicted -- the "this prefetch would have
+ * been wasted on a wrong path" proxy, aggregated per PC for an empirical
+ * waste-concentration (alpha) measurement.
+ *
+ * "Identified gating branch" (v2, see gating_branch_candidates below): each
+ * tracked PC's likely loop-continuation branch is estimated as whichever
+ * conditional/other branch IP most often immediately precedes an occurrence
+ * of that PC in the retirement stream -- a proxy for "the loop's own
+ * back-edge check", since a load at a consistent position in a loop body
+ * will consistently be preceded by that loop's own branch across
+ * iterations. This replaces v1's approach of counting/checking ALL
+ * conditional branches in the issue-to-use window, which measurably
+ * inflated waste fractions by picking up unrelated branches from other
+ * loops/functions that happened to retire in the same window (see
+ * champsim_custom/PHASE2_RESULTS.md). Still an approximation -- no real
+ * control-dependence analysis -- but scoped to the actual loop instead of
+ * the whole retirement stream.
  */
 struct loop_guided : public champsim::modules::prefetcher {
   constexpr static std::size_t TRACKER_SETS = 256;
@@ -93,9 +107,14 @@ struct loop_guided : public champsim::modules::prefetcher {
   std::unordered_map<uint64_t, uint64_t> per_pc_total;
   std::unordered_map<uint64_t, uint64_t> per_pc_wasted;
   std::unordered_map<unsigned, uint64_t> gating_branches_histogram;
+  // ip_key -> {candidate gating-branch ip -> times seen immediately preceding this PC}
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> gating_branch_candidates;
 
   static std::optional<unsigned> detect_period(const std::vector<champsim::block_number::difference_type>& hist);
   void record_prefetch_outcome(uint64_t ip_key, uint64_t use_seq);
+  // Returns (identified gating-branch ip, its vote count, total votes across all candidates for this PC).
+  // ip==0 means no candidate has been observed yet.
+  std::tuple<uint64_t, uint64_t, uint64_t> identify_gating_branch(uint64_t ip_key) const;
 
 public:
   using champsim::modules::prefetcher::prefetcher;

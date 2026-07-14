@@ -1,5 +1,5 @@
 diff --git a/src/ooo_cpu.cc b/src/ooo_cpu.cc
-index 1ac04ff5..d475689a 100644
+index 1ac04ff5..1a6e7754 100644
 --- a/src/ooo_cpu.cc
 +++ b/src/ooo_cpu.cc
 @@ -31,6 +31,11 @@
@@ -30,7 +30,7 @@ index 1ac04ff5..d475689a 100644
 +    // modules can correlate their own prefetch-issue timing against real
 +    // misprediction events (see champsim_custom/instrumentation/branch_log.h).
 +    if (!warmup && ((arch_instr.branch == BRANCH_CONDITIONAL) || (arch_instr.branch == BRANCH_OTHER))) {
-+      speculative_pollution::record_branch(target_mispredicted || direction_mispredicted);
++      speculative_pollution::record_branch(arch_instr.ip.to<uint64_t>(), target_mispredicted || direction_mispredicted);
 +    }
 +
 +    if (target_mispredicted

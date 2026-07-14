@@ -7,6 +7,25 @@
 
 #include "cache.h"
 
+std::tuple<uint64_t, uint64_t, uint64_t> loop_guided::identify_gating_branch(uint64_t ip_key) const
+{
+  auto cand_it = gating_branch_candidates.find(ip_key);
+  if (cand_it == gating_branch_candidates.end())
+    return {0, 0, 0};
+
+  uint64_t identified_ip = 0;
+  uint64_t identified_votes = 0;
+  uint64_t total_votes = 0;
+  for (const auto& [branch_ip, votes] : cand_it->second) {
+    total_votes += votes;
+    if (votes > identified_votes) {
+      identified_votes = votes;
+      identified_ip = branch_ip;
+    }
+  }
+  return {identified_ip, identified_votes, total_votes};
+}
+
 void loop_guided::record_prefetch_outcome(uint64_t ip_key, uint64_t use_seq)
 {
   auto queue_it = pending_issue_seqs.find(ip_key);
@@ -19,8 +38,13 @@ void loop_guided::record_prefetch_outcome(uint64_t ip_key, uint64_t use_seq)
   if (use_seq < issue_seq)
     return; // defensive: shouldn't happen, but don't underflow if it does
 
-  auto gating_branches = use_seq - issue_seq;
-  bool wasted = speculative_pollution::any_mispredicted_in_range(issue_seq, use_seq);
+  auto [identified_ip, identified_votes, total_votes] = identify_gating_branch(ip_key);
+  if (identified_ip == 0)
+    return; // no candidate gating branch identified yet for this PC; skip rather than report a meaningless zero
+  (void)identified_votes;
+  (void)total_votes;
+
+  auto [gating_branches, wasted] = speculative_pollution::scoped_stats(identified_ip, issue_seq, use_seq);
 
   per_pc_total[ip_key] += 1;
   if (wasted)
@@ -57,9 +81,18 @@ uint32_t loop_guided::prefetcher_cache_operate(champsim::address addr, champsim:
   champsim::block_number cl_addr{addr};
   auto found = table.check_hit(tracker_entry{ip});
 
-  // Phase 2 instrumentation: this real access is the "use" for whichever
-  // pending prefetch was issued furthest in the past for this PC, if any.
-  record_prefetch_outcome(ip.to<uint64_t>(), speculative_pollution::current_seq());
+  // Phase 2 instrumentation: record which conditional/other branch most
+  // recently retired immediately before this occurrence -- across many
+  // occurrences, the mode of this is a proxy for this load's loop-gating
+  // branch (see gating_branch_candidates / class header comment).
+  uint64_t ip_key = ip.to<uint64_t>();
+  uint64_t preceding_branch_ip = speculative_pollution::last_branch_ip();
+  if (preceding_branch_ip != 0)
+    gating_branch_candidates[ip_key][preceding_branch_ip] += 1;
+
+  // This real access is the "use" for whichever pending prefetch was issued
+  // furthest in the past for this PC, if any.
+  record_prefetch_outcome(ip_key, speculative_pollution::current_seq());
 
   tracker_entry entry = found.has_value() ? *found : tracker_entry{ip};
 
@@ -135,12 +168,16 @@ void loop_guided::prefetcher_final_stats()
   // wherever you want these to land.
   {
     std::ofstream out("pf_per_pc_waste.csv");
-    out << "pc_hex,total,wasted,wasted_fraction\n";
+    out << "pc_hex,total,wasted,wasted_fraction,gating_branch_ip_hex,gating_branch_confidence\n";
     for (const auto& [ip_key, total] : per_pc_total) {
       auto wasted_it = per_pc_wasted.find(ip_key);
       uint64_t wasted = (wasted_it != per_pc_wasted.end()) ? wasted_it->second : 0;
       double wasted_fraction = total > 0 ? static_cast<double>(wasted) / static_cast<double>(total) : 0.0;
-      out << fmt::format("{:#x},{},{},{:.6f}\n", ip_key, total, wasted, wasted_fraction);
+
+      auto [identified_ip, identified_votes, total_votes] = identify_gating_branch(ip_key);
+      double confidence = total_votes > 0 ? static_cast<double>(identified_votes) / static_cast<double>(total_votes) : 0.0;
+
+      out << fmt::format("{:#x},{},{},{:.6f},{:#x},{:.6f}\n", ip_key, total, wasted, wasted_fraction, identified_ip, confidence);
     }
   }
   {

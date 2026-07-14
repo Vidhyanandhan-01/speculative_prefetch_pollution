@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 /*
@@ -35,9 +36,24 @@
  *
  * Populated by a small, additive patch to ooo_cpu.cc's do_predict_branch
  * (see champsim_custom/patches/ooo_cpu_branch_instrumentation.patch),
- * logging every CONDITIONAL/OTHER branch's real outcome. Read by
+ * logging every CONDITIONAL/OTHER branch's real IP and outcome. Read by
  * champsim_custom/prefetcher/loop_guided to correlate its own prefetch
  * issue timing against real misprediction events.
+ *
+ * v2 (post Phase-2-results audit): the first version's
+ * any_mispredicted_in_range() counted EVERY conditional branch retiring
+ * between a prefetch's issue and use, regardless of whether it had anything
+ * to do with the loop containing the prefetched load -- in a large program
+ * this window can include branches from unrelated loops/functions, which
+ * measurably inflated the observed waste fractions (see
+ * champsim_custom/PHASE2_RESULTS.md). scoped_stats() below instead counts
+ * only occurrences of ONE SPECIFIC branch IP within the window -- the branch
+ * a prefetcher module has identified as that load's likely loop-gating
+ * branch (see loop_guided.cc's gating_branch_candidates: the conditional
+ * branch most often seen immediately preceding an occurrence of that load,
+ * a proxy for "the loop's own back-edge/continuation check"). This is still
+ * an approximation (no real control-dependence analysis), but it is scoped
+ * to the actual loop instead of the whole retirement stream.
  *
  * Header-only: the function-local `static` below is guaranteed to be a
  * single, shared instance across every translation unit that includes this
@@ -49,42 +65,60 @@
 namespace speculative_pollution
 {
 
-inline std::vector<bool>& branch_log()
+struct BranchEvent {
+  uint64_t ip;
+  bool mispredicted;
+};
+
+inline std::vector<BranchEvent>& branch_log()
 {
-  static std::vector<bool> log;
+  static std::vector<BranchEvent> log;
   return log;
 }
 
 // Called from the patched ooo_cpu.cc for every conditional/other branch
 // evaluated. Returns this event's sequence number (its index in the log).
-inline uint64_t record_branch(bool mispredicted)
+inline uint64_t record_branch(uint64_t ip, bool mispredicted)
 {
   auto& log = branch_log();
-  log.push_back(mispredicted);
+  log.push_back(BranchEvent{ip, mispredicted});
   return log.size() - 1;
 }
 
 // The seq the NEXT recorded branch will get, i.e. "how many conditional/
 // other branches have retired so far". Read by a prefetcher module at
-// prefetch-issue time and again when the corresponding real access occurs;
-// the difference between the two readings is an empirical gating_branches
-// sample.
+// prefetch-issue time and again when the corresponding real access occurs.
 inline uint64_t current_seq()
 {
   return branch_log().size();
 }
 
-// Did any branch in [begin_seq, end_seq) mispredict? Used as the "would
-// this prefetch have been wasted on a wrong path" proxy.
-inline bool any_mispredicted_in_range(uint64_t begin_seq, uint64_t end_seq)
+// The IP of the most recently retired conditional/other branch, or 0 if
+// none has retired yet. Used to build a per-load "which branch usually
+// immediately precedes this load" candidate table.
+inline uint64_t last_branch_ip()
+{
+  auto& log = branch_log();
+  return log.empty() ? 0 : log.back().ip;
+}
+
+// Among branches in [begin_seq, end_seq) whose ip == target_ip, how many
+// were there, and did any mispredict? This is the scoped replacement for
+// v1's any_mispredicted_in_range(), which counted ALL branches in range
+// regardless of ip.
+inline std::pair<uint64_t, bool> scoped_stats(uint64_t target_ip, uint64_t begin_seq, uint64_t end_seq)
 {
   auto& log = branch_log();
   end_seq = std::min(end_seq, static_cast<uint64_t>(log.size()));
+  uint64_t count = 0;
+  bool any_mispredicted = false;
   for (uint64_t i = begin_seq; i < end_seq; ++i) {
-    if (log[i])
-      return true;
+    if (log[i].ip == target_ip) {
+      ++count;
+      any_mispredicted = any_mispredicted || log[i].mispredicted;
+    }
   }
-  return false;
+  return {count, any_mispredicted};
 }
 
 } // namespace speculative_pollution
