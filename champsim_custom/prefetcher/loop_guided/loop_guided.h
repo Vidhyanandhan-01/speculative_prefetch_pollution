@@ -93,13 +93,35 @@
  *    still introduces a real bias (the discarded entries are systematically
  *    the ones with the largest gaps) -- counting it makes that bias
  *    visible rather than fixing it outright.
+ *
+ * v4 (root-cause fix for the queue_evictions/stale_dropped pathology v3
+ * only diagnosed): active_lookahead was a SINGLE slot shared across every
+ * tracked PC, and prefetcher_cache_operate reset it to a fresh full batch
+ * every time a period was re-confirmed -- which happens on nearly every
+ * occurrence once locked. With several PCs in the same loop, this meant
+ * constant cross-PC stomping and progress being discarded before it could
+ * ever be issued or matched. Fixed by making lookahead state per-PC
+ * (active_lookaheads, keyed by owner PC) and only replacing a PC's
+ * lookahead once it's fully drained (iters_remaining <= 0) rather than on
+ * every re-detection -- see prefetcher_cache_operate/prefetcher_cycle_operate.
  */
 struct loop_guided : public champsim::modules::prefetcher {
   constexpr static std::size_t TRACKER_SETS = 256;
   constexpr static std::size_t TRACKER_WAYS = 4;
   constexpr static unsigned MAX_PERIOD = 8;          // longest loop period considered
   constexpr static std::size_t HISTORY_LEN = 32;     // deltas retained per PC
-  constexpr static int PREFETCH_DISTANCE_ITERS = 4;  // periods to prefetch ahead once locked
+  // v4: was 4. Reducing this (tested 1/2/4) trades IPC for measurement
+  // reliability: at 4, the per-PC lookahead fix alone still left 3/5 PCs
+  // with pathological queue_evictions/stale_dropped (batches issued far
+  // faster than real occurrences could close them out) despite the best
+  // IPC (0.5476). At 1, 4/5 PCs become clean (only the genuinely
+  // low-frequency/irregular 0x401682 remains -- see PHASE2_RESULTS.md) at
+  // a real IPC cost (0.5127, below even the pre-v4 baseline of 0.5368).
+  // 2 lands in between on both axes without clearly beating either extreme.
+  // Chosen: 1, since this pass's explicit goal is measurement reliability,
+  // not maximizing a throwaway proxy prefetcher's IPC -- but this is a real,
+  // disclosed tradeoff, not a free improvement.
+  constexpr static int PREFETCH_DISTANCE_ITERS = 1; // periods to prefetch ahead once locked
   constexpr static unsigned MIN_REPEATS_TO_LOCK = 2; // consecutive matching cycles required to lock a period
 
   struct tracker_entry {
@@ -173,7 +195,21 @@ struct loop_guided : public champsim::modules::prefetcher {
   constexpr static uint64_t MAX_VALID_GAP_SEQ = 4096;
 
   champsim::msl::lru_table<tracker_entry> table{TRACKER_SETS, TRACKER_WAYS};
-  std::optional<lookahead_entry> active_lookahead;
+  // v4 (Phase 1 re-arm fix): PER-PC lookahead state, keyed by owner PC's raw
+  // address. Was a single std::optional<lookahead_entry> shared across ALL
+  // tracked PCs -- since this module tracks several loads in the same loop
+  // simultaneously (this run: 5 PCs sharing one gating branch), that single
+  // slot meant one PC's occurrence could stomp another's still-in-progress
+  // lookahead, AND (see prefetcher_cache_operate) a period being
+  // re-confirmed on EVERY occurrence reset iters_remaining to a fresh full
+  // batch rather than letting it drain -- together, prefetches were issued
+  // far faster than real occurrences could close them out, which the v3
+  // instrumentation fixes surfaced as pathological queue_evictions/
+  // stale_dropped counts for 3 of 5 tracked PCs (see PHASE2_RESULTS.md).
+  // Each PC now gets its own independent lookahead that is only replaced
+  // once fully drained (see prefetcher_cache_operate), and
+  // prefetcher_cycle_operate advances all active ones per cycle.
+  std::unordered_map<uint64_t, lookahead_entry> active_lookaheads;
 
   // Phase 2 instrumentation state, keyed by source PC's raw address value.
   std::unordered_map<uint64_t, std::deque<uint64_t>> pending_issue_seqs;

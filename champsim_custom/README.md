@@ -43,31 +43,36 @@ own README documents.
 ## Phase 1 validation result
 
 Run against `429.mcf-22B.champsimtrace.xz` (1M warmup / 5M simulation
-instructions), L2C-level prefetcher, vs. the `no`-prefetcher baseline:
+instructions), L2C-level prefetcher, vs. the `no`-prefetcher baseline.
+Current (v4) numbers, after the per-PC lookahead fix and the
+`PREFETCH_DISTANCE_ITERS=1` tradeoff described in `PHASE2_RESULTS.md`:
 
 | | baseline (`no`) | `loop_guided` |
 |---|---|---|
-| IPC | 0.397 | 0.537 (+35%) |
-| L2C LOAD MISS | 106,783 | 81,005 (−24%) |
-| L2C PREFETCH ISSUED | 0 | 88,430 |
-| L2C PREFETCH USELESS | — | 31 |
+| IPC | 0.397 | 0.5127 (+29%) |
+| L2C PREFETCH ISSUED | 0 | 44,507 |
+| L2C PREFETCH USEFUL | — | 25,821 |
 
+(An earlier, more aggressive config reached IPC 0.5476/+36% but left most
+tracked PCs' Phase 2 measurements unreliable — see `PHASE2_RESULTS.md`
+"v4" for the full tradeoff and why measurement reliability was prioritized.)
 Confirms the periodic-delta detection is doing real, sensible work (not a
-no-op) before moving to Phase 2's instrumentation pass.
+no-op).
 
 ## Phase 2: instrumentation
 
-See `PHASE2_RESULTS.md` for the full writeup (v1 → v2 scoping refinement →
-v3 code-review fixes). Summary: the instrumentation plumbing works and is
-purely additive (identical IPC/prefetch counts to Phase 1 through all three
-versions). v3 fixed 10 code-review findings (a warmup-boundary bug that was
-the dominant source of inflated waste fractions, unbounded memory growth,
-non-deterministic tie-breaking, silent data loss, and others) and, in the
-process of validating those fixes, surfaced a further issue: for 3 of 5
-tracked PCs, the `loop_guided` prefetcher's re-arm policy issues prefetches
-faster than real occurrences can close them out, making those PCs'
-measurements unreliable regardless of instrumentation threshold — a Phase 1
-prefetcher-design fix, not a Phase 2 one. **Still not ready to bulk-replace
-`analytical_model/model.py`'s swept assumptions**, but 2 of 5 tracked PCs
-now produce plausible, well-diagnosed numbers (30–73% waste, in the
-analytical model's range).
+See `PHASE2_RESULTS.md` for the full writeup (v1 → v2 scoping → v3
+code-review fixes → v4 prefetcher re-arm fix). Summary: the instrumentation
+plumbing works and is purely additive (identical IPC/prefetch counts to
+Phase 1's config through v1–v3; v4 deliberately changes the prefetcher's own
+behavior, confirmed and disclosed, not an instrumentation side effect). v3
+fixed 10 code-review findings and, in validating them, surfaced a further
+issue: `loop_guided`'s re-arm policy issued prefetches faster than real
+occurrences could close them out. v4 fixed the root cause (per-PC lookahead
+state, no longer a single slot shared/stomped across 5 tracked PCs) and
+tuned `PREFETCH_DISTANCE_ITERS` down to make 4 of 5 tracked PCs' waste
+measurements trustworthy. **Still not ready to bulk-replace
+`analytical_model/model.py`'s swept assumptions** (single workload, short
+window) but two of the four clean PCs carry large sample sizes (~9,500
+each) at an 18.3% waste rate — real, corroborating data inside the
+analytical model's predicted range.

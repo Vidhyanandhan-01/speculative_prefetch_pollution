@@ -153,8 +153,21 @@ uint32_t loop_guided::prefetcher_cache_operate(champsim::address addr, champsim:
       auto period = detect_period(entry.history);
       if (period.has_value()) {
         entry.locked_period = *period;
-        std::vector<champsim::block_number::difference_type> cycle(entry.history.end() - static_cast<long>(*period), entry.history.end());
-        active_lookahead = lookahead_entry{ip, champsim::address{cl_addr}, std::move(cycle), 0, PREFETCH_DISTANCE_ITERS * static_cast<int>(*period)};
+
+        // v4: only (re)arm a fresh lookahead for this PC if it doesn't
+        // already have one still in progress -- previously this ran
+        // unconditionally on every re-detected period (i.e. nearly every
+        // occurrence), discarding whatever budget hadn't been issued yet
+        // and letting several tracked PCs in the same loop repeatedly
+        // stomp each other's single shared lookahead slot. An in-progress
+        // lookahead is left alone to keep draining at its own pace.
+        uint64_t owner_key = ip.to<uint64_t>();
+        auto la_it = active_lookaheads.find(owner_key);
+        bool needs_new_lookahead = (la_it == active_lookaheads.end()) || (la_it->second.iters_remaining <= 0);
+        if (needs_new_lookahead) {
+          std::vector<champsim::block_number::difference_type> cycle(entry.history.end() - static_cast<long>(*period), entry.history.end());
+          active_lookaheads[owner_key] = lookahead_entry{ip, champsim::address{cl_addr}, std::move(cycle), 0, PREFETCH_DISTANCE_ITERS * static_cast<int>(*period)};
+        }
       }
     }
   }
@@ -167,42 +180,46 @@ uint32_t loop_guided::prefetcher_cache_operate(champsim::address addr, champsim:
 
 void loop_guided::prefetcher_cycle_operate()
 {
-  if (!active_lookahead.has_value())
-    return;
+  // v4: advance ALL active per-PC lookaheads each cycle (was: a single
+  // shared lookahead), since several tracked PCs in the same loop are
+  // legitimately in flight at once -- see class header comment / the
+  // active_lookaheads member comment in loop_guided.h.
+  for (auto it = active_lookaheads.begin(); it != active_lookaheads.end();) {
+    auto& la = it->second;
+    if (la.iters_remaining <= 0) {
+      it = active_lookaheads.erase(it);
+      continue;
+    }
 
-  auto& la = *active_lookahead;
-  if (la.iters_remaining <= 0) {
-    active_lookahead.reset();
-    return;
-  }
+    auto delta = la.period_deltas[la.next_delta_idx];
+    champsim::address pf_address{champsim::block_number{la.last_address} + delta};
 
-  auto delta = la.period_deltas[la.next_delta_idx];
-  champsim::address pf_address{champsim::block_number{la.last_address} + delta};
+    if (intern_->virtual_prefetch || champsim::page_number{pf_address} == champsim::page_number{la.last_address}) {
+      const bool mshr_under_light_load = intern_->get_mshr_occupancy_ratio() < 0.5;
+      const bool success = prefetch_line(pf_address, mshr_under_light_load, 0);
+      if (success) {
+        la.last_address = pf_address;
+        la.next_delta_idx = (la.next_delta_idx + 1) % la.period_deltas.size();
+        la.iters_remaining -= 1;
 
-  if (intern_->virtual_prefetch || champsim::page_number{pf_address} == champsim::page_number{la.last_address}) {
-    const bool mshr_under_light_load = intern_->get_mshr_occupancy_ratio() < 0.5;
-    const bool success = prefetch_line(pf_address, mshr_under_light_load, 0);
-    if (success) {
-      la.last_address = pf_address;
-      la.next_delta_idx = (la.next_delta_idx + 1) % la.period_deltas.size();
-      la.iters_remaining -= 1;
-
-      // v3: only record issue timing outside warmup -- branch_log() is
-      // itself empty throughout warmup, so a seq recorded here during
-      // warmup would collide with the "nothing has happened yet" value 0.
-      if (!intern_->warmup) {
-        uint64_t owner_key = la.owner_ip.to<uint64_t>();
-        auto& pending = pending_issue_seqs[owner_key];
-        pending.push_back(speculative_pollution::current_seq());
-        if (pending.size() > PENDING_QUEUE_CAP) {
-          pending.pop_front();
-          per_pc_queue_evictions[owner_key] += 1; // v3: make the eviction (and its bias) visible
+        // v3: only record issue timing outside warmup -- branch_log() is
+        // itself empty throughout warmup, so a seq recorded here during
+        // warmup would collide with the "nothing has happened yet" value 0.
+        if (!intern_->warmup) {
+          uint64_t owner_key = la.owner_ip.to<uint64_t>();
+          auto& pending = pending_issue_seqs[owner_key];
+          pending.push_back(speculative_pollution::current_seq());
+          if (pending.size() > PENDING_QUEUE_CAP) {
+            pending.pop_front();
+            per_pc_queue_evictions[owner_key] += 1; // v3: make the eviction (and its bias) visible
+          }
         }
       }
+      // if the request was rejected (e.g. PQ full), try again next cycle without advancing
+      ++it;
+    } else {
+      it = active_lookaheads.erase(it); // crossed a page boundary; stop rather than guess across pages
     }
-    // if the request was rejected (e.g. PQ full), try again next cycle without advancing
-  } else {
-    active_lookahead.reset(); // crossed a page boundary; stop rather than guess across pages
   }
 }
 
