@@ -262,10 +262,81 @@ def fig5_debugging_journey():
     plt.close(fig)
 
 
+# =============================================================== Figure 6 ==
+# Phase 3 calibration cross-check: measured total DRAM bandwidth overhead
+# (loop_guided vs. no-prefetch baseline) at two distance settings, vs.
+# Magellan's own reported ~10%. Source: champsim_custom/PHASE3_RESULTS.md.
+# Log scale: the values span nearly 4 orders of magnitude.
+def fig6_phase3_calibration():
+    labels = ["Our measurement\n(distance=1,\ncurrent setting)", "Our measurement\n(distance=4,\nhigher-IPC setting)", "Magellan's own\nmeasured overhead"]
+    values = [0.002, 0.031, 10.0]
+    colors = [BLUE, BLUE, RED]
+
+    fig, ax = plt.subplots(figsize=(6.6, 4.4), dpi=200)
+    bars = ax.bar(labels, values, width=0.55, color=colors, zorder=3)
+    ax.set_yscale("log")
+    for rect, v in zip(bars, values):
+        ax.annotate(f"{v:g}%", (rect.get_x() + rect.get_width() / 2, v), xytext=(0, 6),
+                    textcoords="offset points", ha="center", fontsize=11, color=INK_PRIMARY, fontweight="bold")
+    ax.set_ylabel("Total prefetch-bandwidth overhead\n(% of baseline DRAM traffic, log scale)")
+    ax.set_ylim(0.0005, 40)
+    ax.grid(axis="y", which="major", linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    style_axes(ax)
+    ax.set_title("Phase 3: our measured overhead vs. Magellan's own reported figure", fontsize=12, color=INK_PRIMARY, pad=14)
+    fig.tight_layout(rect=(0, 0.13, 1, 1))
+    fig.text(0.5, 0.02, "Same qualitative story (prefetches mostly substitute for demand misses, not add to them) but a much\nsmaller magnitude -- expected, given our deliberately conservative prefetch-distance tuning (Phase 2 v4).",
+              ha="center", fontsize=8.5, color=INK_MUTED)
+    fig.savefig(os.path.join(OUT_DIR, "fig6_phase3_calibration.png"), bbox_inches="tight")
+    plt.close(fig)
+
+
+# =============================================================== Figure 7 ==
+# Phase 4: does the composed model's prediction (made before any real data
+# existed) survive contact with real measured inputs? Source:
+# analytical_model/PHASE4_RESULTS.md.
+def fig7_phase4_validation():
+    fig, ax = plt.subplots(figsize=(8.6, 3.8), dpi=200)
+    ax.set_xscale("log")
+
+    rows = ["Predicted range\n(swept assumptions,\npre-ChampSim)", "Real data: Scenario A\n(fully our own\nmeasured numbers)", "Real data: Scenario B\n(real p_wrong + concentration,\nMagellan-anchored overhead)"]
+    y = [2, 1, 0]
+
+    # Row 0: predicted typical range as a thick span, plus stress case marker
+    ax.hlines(y[0], 0.1, 2.0, color=BLUE, linewidth=10, zorder=3, capstyle="round")
+    ax.scatter([7.7], [y[0]], marker="D", s=55, color=INK_MUTED, zorder=4, label="Stress case (worst swept combination)")
+    ax.annotate("0.1%-2.0% typical", (0.45, y[0]), xytext=(0, 14), textcoords="offset points", ha="center", fontsize=9, color=INK_PRIMARY, fontweight="bold")
+    ax.annotate("7.7% stress case", (7.7, y[0]), xytext=(0, -18), textcoords="offset points", ha="center", fontsize=8.5, color=INK_SECONDARY)
+
+    # Row 1: Scenario A
+    ax.scatter([0.0003], [y[1]], marker="o", s=90, color=INK_MUTED, zorder=4)
+    ax.annotate("0.0003%", (0.0003, y[1]), xytext=(0, 12), textcoords="offset points", ha="center", fontsize=9, color=INK_PRIMARY, fontweight="bold")
+
+    # Row 2: Scenario B -- the headline result
+    ax.scatter([1.62], [y[2]], marker="o", s=130, color=STATUS_GOOD, zorder=5, edgecolor=INK_PRIMARY, linewidth=0.8)
+    ax.annotate("1.62% -- inside the predicted range", (1.62, y[2]), xytext=(0, 12), textcoords="offset points", ha="center", fontsize=9.5, color=INK_PRIMARY, fontweight="bold")
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(rows, fontsize=9.5)
+    ax.set_ylim(-0.8, 2.8)
+    ax.set_xlim(0.0001, 30)
+    ax.set_xlabel("Residual wasted bandwidth (% of one DRAM channel, log scale)")
+    ax.grid(axis="x", which="major", linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    style_axes(ax, hide_spines=("top", "right", "left"))
+    ax.tick_params(axis="y", length=0)
+    ax.set_title("Phase 4: the pre-ChampSim prediction, checked against real measured data", fontsize=12, color=INK_PRIMARY, pad=14)
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
+    fig.savefig(os.path.join(OUT_DIR, "fig7_phase4_validation.png"), bbox_inches="tight")
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     fig1_calibration()
     fig2_composed_sweep()
     fig3_latency_uplift()
     fig4_champsim_empirical()
     fig5_debugging_journey()
+    fig6_phase3_calibration()
+    fig7_phase4_validation()
     print(f"Wrote figures to {OUT_DIR}")
