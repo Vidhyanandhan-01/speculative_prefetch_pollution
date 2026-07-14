@@ -2,9 +2,11 @@
 #define SPECULATIVE_POLLUTION_BRANCH_LOG_H
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <optional>
 #include <utility>
-#include <vector>
 
 /*
  * Shared, header-only event log correlating ChampSim's real per-branch
@@ -40,20 +42,24 @@
  * champsim_custom/prefetcher/loop_guided to correlate its own prefetch
  * issue timing against real misprediction events.
  *
- * v2 (post Phase-2-results audit): the first version's
- * any_mispredicted_in_range() counted EVERY conditional branch retiring
- * between a prefetch's issue and use, regardless of whether it had anything
- * to do with the loop containing the prefetched load -- in a large program
- * this window can include branches from unrelated loops/functions, which
- * measurably inflated the observed waste fractions (see
- * champsim_custom/PHASE2_RESULTS.md). scoped_stats() below instead counts
- * only occurrences of ONE SPECIFIC branch IP within the window -- the branch
- * a prefetcher module has identified as that load's likely loop-gating
- * branch (see loop_guided.cc's gating_branch_candidates: the conditional
- * branch most often seen immediately preceding an occurrence of that load,
- * a proxy for "the loop's own back-edge/continuation check"). This is still
- * an approximation (no real control-dependence analysis), but it is scoped
- * to the actual loop instead of the whole retirement stream.
+ * v2: scoped_stats() counts only occurrences of ONE SPECIFIC branch IP
+ * within a window, instead of v1's any_mispredicted_in_range() which
+ * counted EVERY branch in the window regardless of ip (see
+ * champsim_custom/PHASE2_RESULTS.md for why that inflated waste fractions).
+ *
+ * v3 (post code-review fixes):
+ *  - The log is now a bounded-retention std::deque instead of an
+ *    unboundedly-growing std::vector (code review finding: multi-GB growth
+ *    over a real, long experiment run). BRANCH_LOG_RETENTION is a generous
+ *    margin over realistic issue-to-use windows; scoped_stats() clamps and
+ *    counts truncations via truncated_window_count() so silent data loss
+ *    from eviction is at least observable, even though it can't be avoided
+ *    without unbounded memory.
+ *  - last_branch_ip() now returns std::optional<uint64_t> instead of using
+ *    0 as a sentinel (code review finding: 0 is theoretically a valid IP;
+ *    also brings this in line with detect_period()'s existing use of
+ *    std::optional in loop_guided.cc for the same "value or not yet known"
+ *    shape).
  *
  * Header-only: the function-local `static` below is guaranteed to be a
  * single, shared instance across every translation unit that includes this
@@ -70,55 +76,92 @@ struct BranchEvent {
   bool mispredicted;
 };
 
-inline std::vector<BranchEvent>& branch_log()
+// Bounded retention window for the branch log. Generous relative to
+// realistic issue-to-use gaps (loop_guided.h's PENDING_QUEUE_CAP already
+// bounds outstanding prefetches per PC to 64, and once a PC's gating branch
+// is locked -- see loop_guided.cc v3 -- windows should stay well under this)
+// while keeping worst-case memory bounded (~32MB at 16 bytes/entry) instead
+// of growing without limit for the life of the process.
+constexpr std::size_t BRANCH_LOG_RETENTION = 2'000'000;
+
+struct BranchLogState {
+  std::deque<BranchEvent> log;
+  uint64_t base_seq = 0;          // seq of log.front(); entries before this have been evicted
+  uint64_t truncated_windows = 0; // diagnostic: how many scoped_stats() calls had their begin_seq clamped by eviction
+};
+
+inline BranchLogState& branch_log_state()
 {
-  static std::vector<BranchEvent> log;
-  return log;
+  static BranchLogState state;
+  return state;
 }
 
 // Called from the patched ooo_cpu.cc for every conditional/other branch
-// evaluated. Returns this event's sequence number (its index in the log).
+// evaluated. Returns this event's sequence number.
 inline uint64_t record_branch(uint64_t ip, bool mispredicted)
 {
-  auto& log = branch_log();
-  log.push_back(BranchEvent{ip, mispredicted});
-  return log.size() - 1;
+  auto& state = branch_log_state();
+  state.log.push_back(BranchEvent{ip, mispredicted});
+  uint64_t seq = state.base_seq + state.log.size() - 1;
+  if (state.log.size() > BRANCH_LOG_RETENTION) {
+    state.log.pop_front();
+    ++state.base_seq;
+  }
+  return seq;
 }
 
 // The seq the NEXT recorded branch will get, i.e. "how many conditional/
-// other branches have retired so far". Read by a prefetcher module at
-// prefetch-issue time and again when the corresponding real access occurs.
+// other branches have retired so far" (monotonic regardless of retention
+// eviction, since base_seq + log.size() is an invariant). Read by a
+// prefetcher module at prefetch-issue time and again when the corresponding
+// real access occurs.
 inline uint64_t current_seq()
 {
-  return branch_log().size();
+  auto& state = branch_log_state();
+  return state.base_seq + state.log.size();
 }
 
-// The IP of the most recently retired conditional/other branch, or 0 if
-// none has retired yet. Used to build a per-load "which branch usually
-// immediately precedes this load" candidate table.
-inline uint64_t last_branch_ip()
+// The IP of the most recently retired conditional/other branch, or
+// std::nullopt if none has retired yet (including: none retired since the
+// caller last checked -- e.g. during warmup, when the patched ooo_cpu.cc
+// never calls record_branch() at all). Used to build a per-load "which
+// branch usually immediately precedes this load" candidate table.
+inline std::optional<uint64_t> last_branch_ip()
 {
-  auto& log = branch_log();
-  return log.empty() ? 0 : log.back().ip;
+  auto& state = branch_log_state();
+  if (state.log.empty())
+    return std::nullopt;
+  return state.log.back().ip;
 }
 
 // Among branches in [begin_seq, end_seq) whose ip == target_ip, how many
-// were there, and did any mispredict? This is the scoped replacement for
-// v1's any_mispredicted_in_range(), which counted ALL branches in range
-// regardless of ip.
+// were there, and did any mispredict? If begin_seq has already been evicted
+// by the retention window, it's clamped up to the oldest still-retained seq
+// and truncated_windows is incremented so this is at least observable.
 inline std::pair<uint64_t, bool> scoped_stats(uint64_t target_ip, uint64_t begin_seq, uint64_t end_seq)
 {
-  auto& log = branch_log();
-  end_seq = std::min(end_seq, static_cast<uint64_t>(log.size()));
+  auto& state = branch_log_state();
+  uint64_t available_end = state.base_seq + state.log.size();
+  end_seq = std::min(end_seq, available_end);
+  if (begin_seq < state.base_seq) {
+    begin_seq = state.base_seq;
+    ++state.truncated_windows;
+  }
   uint64_t count = 0;
   bool any_mispredicted = false;
-  for (uint64_t i = begin_seq; i < end_seq; ++i) {
-    if (log[i].ip == target_ip) {
+  for (uint64_t seq = begin_seq; seq < end_seq; ++seq) {
+    const auto& e = state.log[seq - state.base_seq];
+    if (e.ip == target_ip) {
       ++count;
-      any_mispredicted = any_mispredicted || log[i].mispredicted;
+      any_mispredicted = any_mispredicted || e.mispredicted;
     }
   }
   return {count, any_mispredicted};
+}
+
+inline uint64_t truncated_window_count()
+{
+  return branch_log_state().truncated_windows;
 }
 
 } // namespace speculative_pollution

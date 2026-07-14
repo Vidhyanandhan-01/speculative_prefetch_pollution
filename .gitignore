@@ -24,6 +24,9 @@ results/traces/*
 # Analytical model outputs (regenerable via model.py)
 analytical_model/output/
 
+# Local Claude Code tooling state
+.claude/
+
 # OS / editor cruft
 .DS_Store
 *.swp

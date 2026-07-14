@@ -7,23 +7,30 @@
 
 #include "cache.h"
 
-std::tuple<uint64_t, uint64_t, uint64_t> loop_guided::identify_gating_branch(uint64_t ip_key) const
+std::optional<loop_guided::GatingBranchInfo> loop_guided::identify_gating_branch(uint64_t ip_key) const
 {
   auto cand_it = gating_branch_candidates.find(ip_key);
   if (cand_it == gating_branch_candidates.end())
-    return {0, 0, 0};
+    return std::nullopt;
 
   uint64_t identified_ip = 0;
   uint64_t identified_votes = 0;
   uint64_t total_votes = 0;
+  bool have_candidate = false;
   for (const auto& [branch_ip, votes] : cand_it->second) {
     total_votes += votes;
-    if (votes > identified_votes) {
-      identified_votes = votes;
+    // v3: deterministic tie-break (smallest branch ip wins) instead of
+    // relying on unordered_map iteration order, which is unspecified and
+    // can vary across library/compiler versions for equal vote counts.
+    if (!have_candidate || votes > identified_votes || (votes == identified_votes && branch_ip < identified_ip)) {
       identified_ip = branch_ip;
+      identified_votes = votes;
+      have_candidate = true;
     }
   }
-  return {identified_ip, identified_votes, total_votes};
+  if (!have_candidate)
+    return std::nullopt;
+  return GatingBranchInfo{identified_ip, identified_votes, total_votes};
 }
 
 void loop_guided::record_prefetch_outcome(uint64_t ip_key, uint64_t use_seq)
@@ -38,13 +45,35 @@ void loop_guided::record_prefetch_outcome(uint64_t ip_key, uint64_t use_seq)
   if (use_seq < issue_seq)
     return; // defensive: shouldn't happen, but don't underflow if it does
 
-  auto [identified_ip, identified_votes, total_votes] = identify_gating_branch(ip_key);
-  if (identified_ip == 0)
-    return; // no candidate gating branch identified yet for this PC; skip rather than report a meaningless zero
-  (void)identified_votes;
-  (void)total_votes;
+  if (use_seq - issue_seq > MAX_VALID_GAP_SEQ) {
+    // v3: this match is against a prefetch issued too long ago to represent
+    // a realistic prefetch-to-use gap (see MAX_VALID_GAP_SEQ comment in
+    // loop_guided.h) -- drop it rather than scoring it, which would inflate
+    // gating_branches/wasted the same way v1's unscoped window did.
+    per_pc_stale_dropped[ip_key] += 1;
+    return;
+  }
 
-  auto [gating_branches, wasted] = speculative_pollution::scoped_stats(identified_ip, issue_seq, use_seq);
+  // v3: once a PC's gating branch is identified, lock it in and reuse it for
+  // the rest of the run instead of recomputing the plurality winner from a
+  // continuously-mutating vote table on every sample. This keeps every
+  // sample for a given PC scored against the SAME branch (fixing samples
+  // silently being scored against different branches as the vote leader
+  // shifted over time), and this call happens strictly BEFORE the current
+  // occurrence's own vote is recorded (see prefetcher_cache_operate), so a
+  // sample is never scored using a candidate table that already includes
+  // its own vote.
+  auto locked_it = locked_gating_branch.find(ip_key);
+  if (locked_it == locked_gating_branch.end()) {
+    auto identified = identify_gating_branch(ip_key);
+    if (!identified.has_value()) {
+      per_pc_dropped_no_candidate[ip_key] += 1; // v3: make the drop visible instead of silent
+      return;
+    }
+    locked_it = locked_gating_branch.emplace(ip_key, *identified).first;
+  }
+
+  auto [gating_branches, wasted] = speculative_pollution::scoped_stats(locked_it->second.ip, issue_seq, use_seq);
 
   per_pc_total[ip_key] += 1;
   if (wasted)
@@ -81,18 +110,36 @@ uint32_t loop_guided::prefetcher_cache_operate(champsim::address addr, champsim:
   champsim::block_number cl_addr{addr};
   auto found = table.check_hit(tracker_entry{ip});
 
-  // Phase 2 instrumentation: record which conditional/other branch most
-  // recently retired immediately before this occurrence -- across many
-  // occurrences, the mode of this is a proxy for this load's loop-gating
-  // branch (see gating_branch_candidates / class header comment).
-  uint64_t ip_key = ip.to<uint64_t>();
-  uint64_t preceding_branch_ip = speculative_pollution::last_branch_ip();
-  if (preceding_branch_ip != 0)
-    gating_branch_candidates[ip_key][preceding_branch_ip] += 1;
+  // v3: instrumentation bookkeeping is skipped during warmup, matching
+  // branch_log()'s own warmup gating in the ooo_cpu.cc patch (record_branch
+  // is only called when !warmup). Previously this ran unconditionally, so a
+  // prefetch issued during warmup got issue_seq=0 (current_seq() is stuck
+  // at 0 for all of warmup) and, if matched just after warmup ended, was
+  // scored against a window spanning the entire simulation-so-far.
+  if (!intern_->warmup) {
+    uint64_t ip_key = ip.to<uint64_t>();
 
-  // This real access is the "use" for whichever pending prefetch was issued
-  // furthest in the past for this PC, if any.
-  record_prefetch_outcome(ip_key, speculative_pollution::current_seq());
+    // Score any pending prefetch for this PC using ONLY history strictly
+    // prior to this occurrence -- this must happen BEFORE this occurrence's
+    // own vote is added to gating_branch_candidates below, otherwise a
+    // sample could be scored using a candidate table that already includes
+    // its own vote (self-referential bias).
+    record_prefetch_outcome(ip_key, speculative_pollution::current_seq());
+
+    // Record which conditional/other branch most recently retired
+    // immediately before this occurrence -- across many occurrences, the
+    // mode of this is a proxy for this load's loop-gating branch. v3:
+    // bounded to branches within GATING_BRANCH_MAX_IP_DISTANCE of this
+    // load's own ip, a coarse "same function" proxy -- a partial mitigation
+    // for candidate identification otherwise being drawn from the whole,
+    // unscoped global retirement stream (see class header comment).
+    auto preceding_branch_ip = speculative_pollution::last_branch_ip();
+    if (preceding_branch_ip.has_value()) {
+      uint64_t distance = (*preceding_branch_ip > ip_key) ? (*preceding_branch_ip - ip_key) : (ip_key - *preceding_branch_ip);
+      if (distance <= GATING_BRANCH_MAX_IP_DISTANCE)
+        gating_branch_candidates[ip_key][*preceding_branch_ip] += 1;
+    }
+  }
 
   tracker_entry entry = found.has_value() ? *found : tracker_entry{ip};
 
@@ -140,13 +187,18 @@ void loop_guided::prefetcher_cycle_operate()
       la.next_delta_idx = (la.next_delta_idx + 1) % la.period_deltas.size();
       la.iters_remaining -= 1;
 
-      // Phase 2 instrumentation: record this issue's branch_log position so
-      // a future real occurrence of la.owner_ip can measure how many
-      // conditional/other branches intervened and whether any mispredicted.
-      auto& pending = pending_issue_seqs[la.owner_ip.to<uint64_t>()];
-      pending.push_back(speculative_pollution::current_seq());
-      if (pending.size() > PENDING_QUEUE_CAP)
-        pending.pop_front();
+      // v3: only record issue timing outside warmup -- branch_log() is
+      // itself empty throughout warmup, so a seq recorded here during
+      // warmup would collide with the "nothing has happened yet" value 0.
+      if (!intern_->warmup) {
+        uint64_t owner_key = la.owner_ip.to<uint64_t>();
+        auto& pending = pending_issue_seqs[owner_key];
+        pending.push_back(speculative_pollution::current_seq());
+        if (pending.size() > PENDING_QUEUE_CAP) {
+          pending.pop_front();
+          per_pc_queue_evictions[owner_key] += 1; // v3: make the eviction (and its bias) visible
+        }
+      }
     }
     // if the request was rejected (e.g. PQ full), try again next cycle without advancing
   } else {
@@ -168,16 +220,34 @@ void loop_guided::prefetcher_final_stats()
   // wherever you want these to land.
   {
     std::ofstream out("pf_per_pc_waste.csv");
-    out << "pc_hex,total,wasted,wasted_fraction,gating_branch_ip_hex,gating_branch_confidence\n";
+    out << "pc_hex,total,wasted,wasted_fraction,gating_branch_ip_hex,gating_branch_confidence,dropped_no_candidate,queue_evictions,stale_dropped\n";
     for (const auto& [ip_key, total] : per_pc_total) {
       auto wasted_it = per_pc_wasted.find(ip_key);
       uint64_t wasted = (wasted_it != per_pc_wasted.end()) ? wasted_it->second : 0;
       double wasted_fraction = total > 0 ? static_cast<double>(wasted) / static_cast<double>(total) : 0.0;
 
-      auto [identified_ip, identified_votes, total_votes] = identify_gating_branch(ip_key);
-      double confidence = total_votes > 0 ? static_cast<double>(identified_votes) / static_cast<double>(total_votes) : 0.0;
+      // v3: report the LOCKED gating branch (what actually scored this PC's
+      // samples), not a fresh recompute -- keeps the reported branch/
+      // confidence consistent with what's behind wasted_fraction above.
+      uint64_t identified_ip = 0;
+      double confidence = 0.0;
+      auto locked_it = locked_gating_branch.find(ip_key);
+      if (locked_it != locked_gating_branch.end()) {
+        identified_ip = locked_it->second.ip;
+        confidence = locked_it->second.total_votes > 0
+            ? static_cast<double>(locked_it->second.votes) / static_cast<double>(locked_it->second.total_votes)
+            : 0.0;
+      }
 
-      out << fmt::format("{:#x},{},{},{:.6f},{:#x},{:.6f}\n", ip_key, total, wasted, wasted_fraction, identified_ip, confidence);
+      auto dropped_it = per_pc_dropped_no_candidate.find(ip_key);
+      uint64_t dropped = (dropped_it != per_pc_dropped_no_candidate.end()) ? dropped_it->second : 0;
+      auto evict_it = per_pc_queue_evictions.find(ip_key);
+      uint64_t evictions = (evict_it != per_pc_queue_evictions.end()) ? evict_it->second : 0;
+      auto stale_it = per_pc_stale_dropped.find(ip_key);
+      uint64_t stale = (stale_it != per_pc_stale_dropped.end()) ? stale_it->second : 0;
+
+      out << fmt::format("{:#x},{},{},{:.6f},{:#x},{:.6f},{},{},{}\n", ip_key, total, wasted, wasted_fraction, identified_ip, confidence, dropped, evictions,
+                          stale);
     }
   }
   {
@@ -187,4 +257,5 @@ void loop_guided::prefetcher_final_stats()
       out << bucket << "," << count << "\n";
     }
   }
+  fmt::print("loop_guided: branch_log windows truncated by retention eviction: {}\n", speculative_pollution::truncated_window_count());
 }

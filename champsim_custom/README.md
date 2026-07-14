@@ -57,13 +57,17 @@ no-op) before moving to Phase 2's instrumentation pass.
 
 ## Phase 2: instrumentation
 
-See `PHASE2_RESULTS.md` for the full writeup. Summary: the instrumentation
-plumbing works and is purely additive (identical IPC/prefetch counts to
-Phase 1), but the current `gating_branches` measurement counts *every*
-conditional branch retiring between two occurrences of a tracked PC, not
-just branches actually control-dependent on that specific prefetch — likely
-inflating the measured waste fractions (56–99% observed, vs. the analytical
-model's 63% worst case). **Not yet ready to feed back into
-`analytical_model/model.py`** — needs a loop-scoping refinement first
-(tracking branch IP, not just outcome, and restricting the count to
-branches near the tracked load rather than the whole retirement stream).
+See `PHASE2_RESULTS.md` for the full writeup (v1 → v2 scoping refinement →
+v3 code-review fixes). Summary: the instrumentation plumbing works and is
+purely additive (identical IPC/prefetch counts to Phase 1 through all three
+versions). v3 fixed 10 code-review findings (a warmup-boundary bug that was
+the dominant source of inflated waste fractions, unbounded memory growth,
+non-deterministic tie-breaking, silent data loss, and others) and, in the
+process of validating those fixes, surfaced a further issue: for 3 of 5
+tracked PCs, the `loop_guided` prefetcher's re-arm policy issues prefetches
+faster than real occurrences can close them out, making those PCs'
+measurements unreliable regardless of instrumentation threshold — a Phase 1
+prefetcher-design fix, not a Phase 2 one. **Still not ready to bulk-replace
+`analytical_model/model.py`'s swept assumptions**, but 2 of 5 tracked PCs
+now produce plausible, well-diagnosed numbers (30–73% waste, in the
+analytical model's range).
