@@ -1,0 +1,23 @@
+# Editor lock files
+.~lock.*#
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ChampSim build artifacts
+champsim/bin/
+champsim/build/
+champsim/*.o
+
+# Results / traces (large, regenerable)
+results/*
+!results/.gitkeep
+*.champsim.trace*
+*.trace.xz
+
+# OS / editor cruft
+.DS_Store
+*.swp

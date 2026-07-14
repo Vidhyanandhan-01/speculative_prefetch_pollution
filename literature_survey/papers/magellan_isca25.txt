@@ -1,0 +1,2033 @@
+       Magellan: A High-Performance Loop-Guided Prefetcher for
+                       Indirect Memory Access
+                          Gelin Fu                                                       Tian Xia                                         Mingzhuo Yin
+              Xi’an Jiaotong University                                      Xi’an Jiaotong University                               Xi’an Jiaotong University
+                     Xi’an, China                                                   Xi’an, China                                            Xi’an, China
+               fugelin@stu.xjtu.edu.cn                                         tian_xia@xjtu.edu.cn                                  ymzymz@stu.xjtu.edu.cn
+
+                   Prashant J. Nair                                                   Mieszko Lis                                           Pengju Ren
+      The University of British Columbia                             The University of British Columbia                              Xi’an Jiaotong University
+             Vancouver, Canada                                              Vancouver, Canada                                               Xi’an, China
+          prashantnair@ece.ubc.ca                                          mieszko@ece.ubc.ca                                         pengjuren@xjtu.edu.cn
+
+Abstract                                                                                              ACM Reference Format:
+Graph analytics and sparse linear algebra applications heavily rely                                   Gelin Fu, Tian Xia, Mingzhuo Yin, Prashant J. Nair, Mieszko Lis, and Pengju
+                                                                                                      Ren. 2025. Magellan: A High-Performance Loop-Guided Prefetcher for Indi-
+on indirect memory access (IMA). IMAs are characterized by poor
+                                                                                                      rect Memory Access. In Proceedings of the 52nd Annual International Sym-
+temporal and spatial locality, which causes frequent high-latency                                     posium on Computer Architecture (ISCA ’25), June 21–25, 2025, Tokyo, Japan.
+DRAM accesses. While dedicated hardware prefetchers for IMA                                           ACM, New York, NY, USA, 15 pages. https://doi.org/10.1145/3695053.3731054
+have been explored, they target narrow access patterns and tend
+to introduce significant hardware complexity. Software prefetch-
+ing offers a promising alternative, leveraging compiler analysis to
+                                                                                                      1    Introduction
+prefetch indirection patterns. However, existing software prefetch-                                   Sparse irregular algorithms are key to various application domains,
+ers struggle with sparse applications due to limited loop iterations                                  including graph analysis [50, 53], high-performance computing
+and complex IMA patterns across nested loops.                                                         [43], and machine learning [20]. These algorithms often rely on
+   We propose Magellan, a novel loop-guided software prefetcher                                       indirect memory accesses (IMAs), where elements in one array are
+designed to detect and schedule IMA prefetches efficiently. Mag-                                      used as indices to access another array. IMAs, however, introduce
+ellan introduces two key innovations: (1) extracting dependence                                       significant challenges due to their highly irregular index values.
+graphs across loop levels to detect complex IMA patterns and (2) cap-                                 This irregularity results in frequent cache misses and high-latency
+turing inner-outer loop semantics to prefetch for both current and                                    DRAM accesses, creating a bottleneck that severely impacts per-
+future iterations. We evaluate Magellan on 14 memory-intensive                                        formance. This paper focuses on developing efficient prefetching
+benchmarks using real-world datasets from social networks and                                         strategies to alleviate the performance overhead of IMAs.
+web graphs. Compared to the best existing IMA software prefetcher,                                       Memory access prefetching is a well-established technique for
+Magellan reduces cache misses by 25% and dynamic instruction                                          mitigating latency bottlenecks and can be implemented in hard-
+counts by 14% on average. This results in a 1.14× average speedup,                                    ware or software [27]. Several studies have proposed specialized
+with performance gains of up to 1.41×.                                                                hardware prefetchers tailored to IMA patterns [2, 3, 22, 23, 28, 29, 59,
+                                                                                                      60, 68, 75, 82, 84]. For example, IMP [84] and DMP [29] exploit arith-
+                                                                                                      metic regularity in memory address histories to prefetch indirection
+CCS Concepts                                                                                          patterns. Event-Trigger [3] and Prodigy [75] annotate indirection
+• Software and its engineering → Compilers.                                                           semantics in software, which are then offloaded to programmable
+                                                                                                      hardware at runtime to issue prefetching requests. Although these
+                                                                                                      prefetchers deliver substantial performance improvements, they are
+Keywords                                                                                              impractical for real-world scenarios due to their reliance on narrow
+Software Prefetcher, Indirect Memory Access, Memory Hierarchy                                         access patterns and the additional chip area required for custom
+                                                                                                      logic. Consequently, commercial CPUs, such as Intel Xeon [36], use
+                                                                                                      simpler prefetchers like next-line [73] and stride prefetchers [21],
+                                                                                                      which cannot effectively handle IMA patterns.
+                                                                                                      Why Use Software Prefetchers: Compiler-based software prefetch-
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed                 ing techniques have been proposed to overcome the limitations
+for profit or commercial advantage and that copies bear this notice and the full citation             of hardware prefetchers. Software prefetchers can respond to dy-
+on the first page. Copyrights for components of this work owned by others than the                    namic program behaviors without increasing processor complexity.
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission         Most existing software prefetching approaches focus on regular
+and/or a fee. Request permissions from permissions@acm.org.                                           access patterns, such as stride accesses [35, 54] and linked-list tra-
+ISCA ’25, Tokyo, Japan                                                                                versals [19, 49, 71, 80]. Some software prefetchers like SW Prefetch
+© 2025 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 979-8-4007-1261-6/25/06                                                                      [4] aim to specifically target IMA patterns of the form x[a[i]]. They
+https://doi.org/10.1145/3695053.3731054                                                               identify load instructions referencing loop induction variables and
+                                                                                                  1
+
+
+
+
+                                                                                                601
+ISCA ’25, June 21–25, 2025, Tokyo, Japan                                                                                                       Gelin Fu, Tian Xia, Mingzhuo Yin, Prashant J. Nair, Mieszko Lis, and Pengju Ren
+
+
+     Breath-first search algorithm with SW Prefetch                                                    SW Prefetch
+                                                                   Local IMA    Global IMA
+1  While(start_pointer<end_pointer) {                                                                 detection scope
+2    node = Worklist[start_pointer] ;
+3    prefetch_node = min(start_pointer+32, end_pointer-1);   Worklist
+4    prefetch(Offset[Worklist[prefetch_node]]);
+5    start, end = Offset[node], offset[node +1];
+6    range = end – start;                                                                        …
+                                                             Offset
+7    for(j = 0;j<range;j++){
+
+
+
+
+                                                                                                                         Outer loop
+8        Neighbor = Edgelist[start+j];
+9        prefetch_j = min(j+32, range);
+10       prefetch(Visited[Edgelist[start+prefetch_j]]);      Edgelist
+         if ! Visited[Neighbor] {
+
+
+
+
+                                                                                                            Inner loop
+11
+12            Visited[Neighbor] = true；
+13            Worklist[end_pointer++] = Neighbor;}
+14    }                                                      Visited
+15    start_pointer++;
+16 }
+                                                                                                                                            Figure 2: LLC miss breakdown of various sparse applications
+                    (a) BFS pseudo code                                   (b) BFS traversal pattern                                         on Intel Kabylake. On average, 60% of the IMA-related misses
+                                                                                                                                            remain unresolved despite using prefetchers.
+Figure 1: Pseudo code (a) and traversal pattern (b) of breath-
+first-search (BFS) graph algorithm from GAP benchmark
+[13] with SW Prefetch [4]. In 85.3% of cases, indices like j+32
+exceed the inner-loop boundary and are replaced with the
+                                                                                                                                            These misses are challenging to prefetch effectively, highlighting
+boundary value – thus negating any software prefetch.
+                                                                                                                                            the limitations of current software prefetching techniques.
+                                                                                                                                            Goal: This work aims to enhance the performance of software
+use a depth-first search algorithm to generate prefetching instruc-                                                                         prefetchers for sparse irregular applications by addressing three
+tions. Despite this, our studies observed that SW Prefetch struggled                                                                        key challenges: (1) exploiting more prefetch opportunities in loops
+to match the performance of advanced hardware prefetchers like                                                                              with a small number of iterations; (2) accurately detecting complex
+DMP [29] (see Fig.18 in Section 5.4). We observed that the effective-                                                                       IMAs that span nested loops. (3) ensuring that the inserted prefetch
+ness of such software prefetchers is limited in sparse irregular appli-                                                                     instructions do not compromise program correctness. We propose
+cations due to: (1) sparse data distributions that restrict prefetching                                                                     the Magellan software prefetcher to address these challenges.
+opportunities, and (2) their inability to prefetch complex indirection                                                                      Insights and Mechanisms: Magellan uses the observation that
+patterns found in nested loops.                                                                                                             IMAs often operate within nested loops where inner loops are inter-
+Challenges: The limitations of SW Prefetch can be illustrated us-                                                                           dependent. To exploit inter-loop prefetch opportunities, Magellan
+ing the breadth-first search (BFS) algorithm shown in Fig.1(a) and                                                                          detects the nested loop pattern, a framework that describes the
+its indirection pattern in Fig.1(b). SW Prefetch restricts prefetch                                                                         behavior of IMA loads across different loop levels. Based on pat-
+addresses to the current loop iteration to ensure valid look-ahead                                                                          terns observed in real-world sparse applications, Magellan classifies
+prefetches. For example, to prefetch the IMA load Visited (line                                                                             nested loop patterns into three categories: stream-in, stream-out,
+11), it computes the prefetch index by incrementing the induction                                                                           and irregular. For each, it applies a tailored prefetching strategy that
+variable j with an ahead distance and comparing it to the loop                                                                              balances instruction overhead and prefetch candidate exploration
+boundary range (line 9). This index is then used to generate an indi-                                                                       to maximize performance in specific scenarios.
+rect prefetch for Visited (line 10). However, when processing sparse                                                                           Magellan extends its scope beyond single-level loops by leverag-
+matrices, such as web graphs or road networks [13, 16, 18, 46],                                                                             ing the Loop Dependence Graph (LDG) to enhance the detection
+most vertices have few neighbors, resulting in tight inner loops.                                                                           of nested IMA patterns. The LDG is a directed graph that cap-
+Our experiments show that in 85.3% of cases, indices like j+32                                                                              tures the reference-chasing sequences of induction variables and
+exceed the loop boundary and are replaced with the boundary                                                                                 loads across multiple loop levels. Using the LDG, Magellan iter-
+value. Thus, most prefetches redundantly target the same address,                                                                           ates through load instructions to independently detect local and
+Visited[Edgelist[start+range]], which significantly reduces their ef-                                                                       global IMAs, enabling more effective and comprehensive prefetch-
+fectiveness. Furthermore, BFS features two types of IMAs that chal-                                                                         ing across nested loops. This approach bridges the gap between
+lenge SW Prefetch. Local IMAs, such as accesses to Offset and                                                                               theoretical opportunities for prefetching and practical implementa-
+Visited, occur within the same loop. In contrast, global IMAs, such                                                                         tion, addressing the complexities of irregular access patterns.
+as accesses to Edgelist, depend on an outer-loop variable (start).                                                                          Ensuring Safe Prefetches: Magellan modifies the original pro-
+High-performance IMA prefetchers require intelligent mechanisms                                                                             gram’s code structure by explicitly inserting prefetch instructions.
+to detect different IMA patterns from the source program.                                                                                   However, due to the speculative nature of prefetching, the prefetched
+   To quantify the impact of these factors, Fig. 2 presents the cache                                                                       addresses may be inaccurate and cross the protection domain, po-
+efficiency of various graph analysis and high-performance com-                                                                              tentially compromising program safety. Traditional approaches,
+puting algorithms using hardware and software prefetchers. Stride                                                                           such as Software Fault Isolation, validate prefetched addresses by
+and next-line hardware prefetchers eliminate only a small fraction                                                                          adding conditional bound checks for each address [72, 76]. However,
+of cache misses. Adding SW Prefetch reduces more cache misses,                                                                              these checks often incur significant performance overhead, slowing
+but over 60% of IMA-related misses remain unresolved. This is-                                                                              execution by up to 2× [77]. Magellan takes a different approach to
+sue is particularly pronounced in algorithms like BFS, SSSP, and                                                                            ensure safe prefetches without sacrificing performance. It identifies
+BC, where more than 30% of cache misses stem from global IMAs.                                                                              memory allocation functions associated with the prefetched data
+                                                                                                                                        2
+
+
+
+
+                                                                                                                                      602
+Magellan: A High-Performance Loop-Guided Prefetcher for Indirect Memory Access                                                                ISCA ’25, June 21–25, 2025, Tokyo, Japan
+
+
+structures and extends their storage space to guarantee prefetch ad-                          for (i=0; i<num; i++)          for (i=0; i<num; i++)       for (i=0; i<num; i++)
+dress correctness. Since sparse applications typically involve large                             idx = a[i];                   for (j=0; j<size; j++)      offset, size = select_node(i);
+                                                                                                 result += x[idx];                idx = a[i]+j;            for (j=0; j<size; j++)
+datasets, Magellan requires only 0.0036% additional memory.                                                                       result += x[idx];             idx = a[offset+j]; // Global IMA
+                                                                                 a        x                                         a           x               load x[idx];       // Local IMA
+Key Results: We evaluated Magellan using both real processors                    2       90                                         1          90               work(x[idx]);
+and the GEM5 simulator [15], comparing it with five state-of-the-art                                                        i       0        245
+                                                        Prefetch strategyi 31 245        64                                         3          64
+hardware prefetchers (IPCP [66], Berti [61], IMP [84], Event-trigger                                                                2          16
+                                                                                 0       16
+[3], and DMP [29]) and three software prefetchers (SW Prefetch [4],
+                                                                            (a)  Local IMA                    (b) Global IMA                      (c) Application model
+Intel OneAPI [65], and APT-GET [38]). The benchmarks included
+14 real-world applications spanning sparse linear algebra, graph        Figure 3: Two basic IMA types: Local IMA (a), global IMA (b),
+analytics, and databases. Compared to the best software prefetcher,     and application model of sparse applications (c).
+Magellan reduces cache misses by 25% and dynamic instruction
+counts by 14% on average, achieving a 1.14× average speedup (up                                     Prefetch for current loop         Prefetch for future loop
+to 1.41×). Magellan performs on par with the best hardware IMA
+                                                                          Inner loop-1 Inner loop-2 …           Inner loop-1 Inner loop-2 …             Inner loop-1 Inner loop-2 …
+prefetcher, DMP, but without the additional hardware overhead.
+Contributions: This paper makes the following contributions:
+(1) We propose Magellan, a high-performance software prefetcher                               (a) Inner-bound prefetching            (b) Outer prefetching         (c) Inner-free prefetching
+designed to efficiently detect and prefetch both local and global                           Figure 4: Three prefetching strategies for sparse applications:
+indirect memory access (IMA) patterns in sparse applications.                               inner-bound prefetching, inner-free prefetching, and outer
+(2) We develop mechanisms for constructing global dependence                                prefetching. Inner-free and outer prefetching exploit more
+graphs, detecting nested loop patterns, and avoiding program faults.                        prefetch opportunities beyond the current loop.
+These enable accurate detection of indirection patterns and loop
+semantics, while ensuring the safety of prefetching requests.
+(3) We provide an LLVM pass that automatically identifies indi-                             be categorized as local or global indirection. Each index value is
+rection patterns and implements the corresponding prefetching                               used in local indirection to fetch a single data element at a time, as
+strategies into the original programs, enabling seamless integration                        shown in Fig.3(a). In contrast, global indirection uses each index
+into existing workflows.                                                                    as a base address to fetch several consecutive elements, with the
+(4) We extensively evaluate Magellan across diverse workloads,                              offset provided by an inner-loop induction variable, as depicted in
+demonstrating that it outperforms state-of-the-art prefetchers. We                          Fig.3(b). These local and global IMA types can combine to form
+also provide in-depth analysis and discussions on Magellan’s per-                           complex indirect access patterns.
+formance and effectiveness.                                                                    A common code pattern in many sparse and graph applications
+                                                                                            involves two-level loops. In the outer loop, a working node is se-
+2     Background and Motivation                                                             lected at each iteration (e.g., a vertex in a graph, row, or column in a
+Indirect memory access (IMA) refers to data-dependent loads that                            sparse matrix). The inner loop then traverses related elements—such
+explicitly link separate data structures. IMAs are prevalent in sparse                      as the edges of a vertex or the non-zero elements of a row or col-
+computing domains such as graph analytics [2, 3, 12, 75] and sparse                         umn—with contiguous addresses. Fig. 3(c) provides a code example
+linear algebra [50, 63, 64, 81]. These applications frequently use                          of this pattern. Here, accessing multiple elements of the selected
+IMAs to access neighbor vertices in graphs or non-zero elements                             node (i.e., idx = a[offset + j]) represents a global IMA, while loading
+within sparse matrices. Due to their substantial size, sparse matrices                      the property of each element (i.e., load(x[idx])) is a local IMA.
+and graphs typically exceed on-chip cache capacities [10, 18], re-
+sulting in irregular IMAs and frequent cache misses. Consequently,                          2.2      Prefetching Beyond Current Loop
+these misses lead to high-latency DRAM accesses and degrade per-
+                                                                                            One of the first software techniques targeting IMAs is Ainsworth
+formance on contemporary processors.
+                                                                                            and Jones’s SW Prefetch [4]. SW Prefetch primarily focuses on local
+   To mitigate these memory-related bottlenecks, this paper in-
+                                                                                            IMAs within inner loops without considering nested loop structures.
+troduces specialized prefetching techniques tailored for sparse ap-
+                                                                                            Consequently, the address predictions are confined to the current
+plications. We define two fundamental types of IMAs commonly
+                                                                                            inner loop – a method we refer to as inner-bound prefetching (see
+found in these workloads, local and global indirection, and pro-
+                                                                                            Fig. 4(a)). However, inner loops are often interrelated through outer
+pose a corresponding application model. Additionally, we present
+                                                                                            loops, presenting additional prefetching opportunities from inter-
+three distinct prefetching strategies designed for different usage
+                                                                                            loop dependencies that SW Prefetch has overlooked.
+scenarios, each associated with varying overheads, and thoroughly
+                                                                                               The first scheme to use nested loop structures is APT-GET [38],
+evaluate their effectiveness.
+                                                                                            which employs outer prefetching to prefetch data in outer loops and
+                                                                                            maintain prefetch timeliness. However, as shown in Fig.4(b), outer
+2.1     Indirection Types and Application Model                                             prefetching only prefetches data for the next inner loops, which
+An IMA typically involves two data structures: an index array a[]                           ignores the intrinsic relationship between adjacent inner loops and
+and a target array x[]. Depending on how the values in the index                            may achieve lower performance due to limited coverage. To exploit
+array are used to fetch elements from the target array, IMAs can                            more prefetching opportunities, we propose a new prefetching
+                                                                                       3
+
+
+
+
+                                                                                    603
+ISCA ’25, June 21–25, 2025, Tokyo, Japan                                                                                                         Gelin Fu, Tian Xia, Mingzhuo Yin, Prashant J. Nair, Mieszko Lis, and Pengju Ren
+
+
+
+                  100%                                                                        100%                                           3     The Design of Magellan Prefetcher
+  Miss rate reduction
+
+
+
+
+                                                                            Miss rate reduction
+                          80%         Inner-free                                                  80% Inner-free                             Fig. 6 provides an overview of the Magellan prefetcher. It inserts
+                                                  r                                                                    r
+                                               tte                                                                  tte
+                          60%                Be                                                   60%             Be                         prefetching instructions into a target program through four phases.
+                          40%                      Inner-bound                                    40%            Inner-bound                 First, Magellan detects IMA patterns within the target program us-
+                          20% Outer                                                               20%                                        ing a Loop Dependence Graph (LDG), which analyzes dependencies
+                                                                                                         Outer
+                            0                                                                        0                                       between loops at different levels and their associated loads. Once an
+                                  20% 40% 60% 80% 100%                                                     20% 40% 60% 80% 100%
+                                 Extra executed instruction                                               Extra executed instruction         IMA is detected, Magellan identifies its nested-loop pattern to de-
+                                         (a) SpMV                                                              (b) PageRank
+                        100%                                                             100%
+                                                                        Miss rate reduction
+                                                                                                                                             scribe the relationships between IMAs in the inner and outer loops.
+                                                                                                                                             Based on this pattern, it implements the appropriate prefetching
+    Miss rate reduction
+
+
+
+
+                          80%                                                                     80%
+                                                  r                                                                       r
+                                               tte                                                                     tte                   strategy. Finally, Magellan performs program fault avoidance to
+                          60% Outer          Be
+                                                                                                  60%                Be
+                          40%                                                                     40%                                        ensure that the inserted prefetch instructions are valid and do not
+                          20%                  Inner-bound                                        20% Outer        Inner-bound               cause memory access violations.
+                                      Inner-free                                                                 Inner-free
+                             0                                                                      0
+                                  20% 40% 60% 80% 100%                                                     20% 40% 60% 80% 100%
+                                 Extra executed instruction                                               Extra executed instruction         3.1     IMA Detection
+                                          (c) BFS                                                                (d) SSSP
+                                                                                                                                             3.1.1 Loop Dependence Graph (LDG): Abstracting Indirection Across
+                                                                  1.6                                                            1.8
+                                                                                                                                             Nested Loops. Sparse applications typically employ two types of
+                               Legend:                            1.4                                                                        indirect memory accesses (IMAs): local and global. Local IMAs occur
+                                                        Speedup
+
+
+
+
+                            No prefetch                                                                                                      within a single-level loop, while global IMAs span across nested
+                            Inner-bound prefetch                  1.2
+                                                                                                                                             loops. Detecting these IMAs requires capturing load dependencies
+                            Inner-free prefetch
+                                                                  1.0                                                                        between different loop levels – a capability that prior techniques
+                            Outer prefetch
+                                                                  0.8                                                                        lack. Magellan addresses this challenge using a directed graph called
+                                                                        SpMV PageRank BFS                                     SSSP
+                                                                              (e) Performance                                                the Loop Dependence Graph (LDG), which abstracts the sequences
+                                                                                                                                             of load instructions and induction variables in nested loops.
+Figure 5: Prefetch effectiveness and performance of IMA                                                                                         Figure 7 shows a portion of the LDG constructed for the double-
+prefetch with different prefetching strategies. We evaluate                                                                                  nested loop in the BFS algorithm from the GAP benchmark suite
+the benefits of reducing the cache miss rate and the overhead                                                                                [13]. In this graph, each node represents a load instruction or a
+of executing extra instructions.                                                                                                             loop induction variable. A directed edge from node a to node b
+                                                                                                                                             indicates that node b is data-dependent on node a. A key feature
+                                                                                                                                             of the LDG is its ability to represent dependencies across different
+                                                                                                                                             loop levels, providing the offsets for inner-loop global IMAs based
+method named inner-free prefetching. As shown in Fig.4(c), inner-
+                                                                                                                                             on outer-loop variables.
+free prefetching exploits inter-loop opportunities by aggressively
+                                                                                                                                                The figure also shows three common structures of global IMAs
+issuing prefetches for both current and future inner loops.
+                                                                                                                                             found in real-world applications, highlighting how cross-loop de-
+   However, software prefetching is a complex problem whose
+                                                                                                                                             pendencies are linked in various ways. In Fig. 7(a) and (b), the outer-
+effect is influenced by the trade-off between two factors. On the
+                                                                                                                                             loop load is directly or indirectly included in the source operand of
+one hand, useful prefetches reduce cache misses. On the other hand,
+                                                                                                                                             the global IMA. In contrast, Fig. 7(c) encodes the outer-loop load
+prefetch instructions consume additional CPU cycles. Therefore, a
+                                                                                                                                             into the loop iteration condition. During LDG construction, Magel-
+prefetch strategy may result in very different trade-off effects on
+                                                                                                                                             lan unifies these forms into a consistent representation to facilitate
+different applications due to their various loop structures.
+                                                                                                                                             the detection of global IMAs.
+   To validate our approach, we evaluate the performance of these
+three prefetching strategies on four sparse applications from the                                                                            3.1.2 Construction and Traversal of the LDG. Magellan follows
+GAP benchmark suite [13]: Sparse Matrix-Vector Multiplication                                                                                the procedure outlined in Algorithm 1 to build a target program’s
+(SpMV), PageRank, Breadth-First Search (BFS), and Single Source                                                                              Loop Dependence Graph (LDG). Since local and global IMAs reside
+Shortest Path (SSSP), using the large com-LiveJournal web graph                                                                              within loops, Magellan first searches for basic blocks encapsulated
+from the SuiteSparse Collection [24]. Figures 5(a)–(d) illustrate                                                                            by loops (line 3). Within each block, it leverages insights similar
+the trade-offs of each prefetching strategy, assessing benefits by                                                                           to those used in SW Prefetch [4], recursively iterating over the
+cache miss reduction rates and overheads by executed instruction                                                                             source operands of each load instruction to construct dependency
+counts. We observe that each prefetching strategy exhibits different                                                                         chains (lines 4 and 12). This backward traversal continues until it
+trade-off tendencies. Specifically, inner-bound prefetching tends                                                                            encounters another load instruction or an induction variable (line
+to incur higher instruction overhead, while inner-free and outer                                                                             17). Dependencies related to loop iteration conditions are detected
+prefetching have lower instruction overhead, but their effectiveness                                                                         by examining the incoming instructions of the loop (line 7). Using
+varies significantly across applications.                                                                                                    these detected dependencies, Magellan constructs the LDG (line 9).
+   As shown in Fig. 5(e), the impact of prefetching strategies differs                                                                           With the LDG constructed, Magellan begins at each load node
+markedly among applications and can sometimes even degrade per-                                                                              and traverses its source operands to detect different types of IMA
+formance. Therefore, efficient IMA prefetching necessitates iden-                                                                            patterns. If a load depends on another load from the same loop level,
+tifying the patterns of nested loop structures and selecting the                                                                             it is identified as a local IMA. Conversely, if it depends on an induc-
+appropriate prefetching strategy accordingly.                                                                                                tion variable and another load from an outer loop, it is classified
+                                                                                                                                         4
+
+
+
+
+                                                                                                                                       604
+Magellan: A High-Performance Loop-Guided Prefetcher for Indirect Memory Access                                                                                 ISCA ’25, June 21–25, 2025, Tokyo, Japan
+
+
+
+
+      Target program             IMA detection § 3.1         Nested loop pattern detection § 3.2             Prefetch strategy implementation § 3.3   Fault avoidance § 3.4    Program with prefetch
+                                                                                         Magellan prefetcher
+
+
+
+               Figure 6: Magellan takes four steps to insert efficient and safe prefetching instructions for a target program.
+                                 Induction variable      Load           dependance                                  patterns: stream-in, stream-out, and irregular. Figure 8 shows their
+                                              LDG of BFS algorithm                                                  respective code structures, memory traversal patterns, and repre-
+                       Outer Loop                                               Inner Loop                          sentative use cases. Each pattern incrementally processes elements
+          start                Work                             j                Edge
+         pointer               list
+                                            Offset
+                                                                                 list
+                                                                                              Visited               in the inner loop, aligning with sequential traversals of non-zero el-
+                                                                                                                    ements within matrix rows or edges connected to vertices in graph
+                                                                                                                    computations. However, the relationships between iterations of the
+      for (i=0; i<num; i++)             for (i=0; i<num; i++)
+                                                                          for (i=0; i<num; i++)                     outer loops vary distinctly across these patterns, as detailed below:
+        for (j=0; j<size; j++)            offset=a[i]
+                                                                            for (j=a[i]; j<a[i]+size; j++)
+             result+=x[a[i]+j];           for (j=0; j<size; j++)
+                                                                                 result+=x[j];                          (1) Stream-in. In this pattern, the outer loop moves in the same
+                                               result+=x[offset+j];
+                                                                                                                            direction as the inner loop, resulting in the inner-loop in-
+         i       a         x            i       a      offset       x       i        a       j        x
+                                                                                                                            duction variable j changing continuously across inner-loop
+                  j                                      j
+                                                                                                                            iterations. This pattern frequently occurs in sparse linear
+             Structure-1                    Structure-2                   Structure-3
+                                Three common code structures of global IMA
+                                                                                                                            algebra and graph computations, where rows of matrices or
+                                                                                                                            vertices in graphs are processed sequentially. A single-level
+Figure 7: Loop Dependence Graph (LDG) for double nested                                                                     loop can be seen as a special case of the stream-in pattern,
+loop of BFS application and the three common code struc-                                                                    involving only one iteration of the outer loop.
+tures for global IMA.                                                                                                   (2) Stream-out. In contrast to stream-in, the outer loop moves
+                                                                                                                            in the opposite direction to the inner loop, causing the inner-
+Algorithm 1 Loop Dependence Graph Construction                                                                              loop induction variable j to exhibit discontinuity between
+ 1: 𝑔𝑟𝑎𝑝ℎ ← { }                                                                                                             iterations. Typically, this pattern traverses matrix rows or
+ 2: for all 𝑏 in 𝑓 𝑢𝑛𝑐𝑡𝑖𝑜𝑛.𝑏𝑎𝑠𝑖𝑐𝑏𝑙𝑜𝑐𝑘𝑠 do                                                                                   columns in reverse order. For instance, the Symmetric Gauss-
+ 3:     if 𝐿 = 𝑔𝑒𝑡𝐿𝑜𝑜𝑝 𝑓 𝑜𝑟 (𝑏 ) ≠ null then                                                                                Seidel Smoother (SYMGS) in HPCG [25] uses the stream-
+ 4:         for all 𝑙𝑑 in 𝑏.𝑙𝑜𝑎𝑑𝑖𝑛𝑠𝑡𝑠 do
+                                                                                                                            out pattern during its back-triangular solve, an essential
+ 5:             analyze_dfs(𝑙𝑑)
+                                                                                                                            operation in multigrid sparse solvers.
+ 6:        if 𝑖𝑣 = 𝑔𝑒𝑡𝐼𝑛𝑑𝑢𝑐𝑡𝑖𝑜𝑛𝑉 𝑎𝑟𝑖𝑎𝑏𝑙𝑒 (𝐿) ≠ null then
+                                                                                                                        (3) Irregular. This pattern features an outer loop whose direc-
+ 7:            analyze_dfs(𝑔𝑒𝑡𝑃ℎ𝑖𝐼𝑛𝑐𝑜𝑚𝑖𝑛𝑔 (𝑖𝑣))
+                                                                                                                            tion is not fixed, varying dynamically during execution. It
+ 8:        for all 𝑝 in 𝑟𝑒𝑠𝑢𝑙𝑡𝑠.𝑝𝑎𝑡ℎ𝑠 do
+                                                                                                                            commonly appears in graph algorithms, where vertices are
+ 9:            𝑔𝑟𝑎𝑝ℎ.𝑐𝑜𝑛𝑛𝑒𝑐𝑡 (𝑝 )
+                                                                                                                            accessed in arbitrary sequences at runtime.
+10: function analyze_dfs(𝑖𝑛𝑠𝑡 )
+11:    𝑝𝑎𝑡ℎ ← { }
+                                                                                                                   3.2.2 Detection. Magellan follows a three-step process to detect
+12:    for all 𝑜𝑝 in 𝑖𝑛𝑠𝑡 .𝑜𝑝𝑒𝑟𝑎𝑛𝑑𝑠 do
+13:        if 𝑜𝑝 is not an instruction then
+                                                                                                                   the nested loop pattern of an IMA load within nested loops, as
+14:            continue                                                                                            shown in Fig. 10. First, it locates the loop induction variable as-
+15:        if 𝑜𝑝 is Call, Store, or Terminator then                                                                sociated with the IMA load. It identifies its preheader and latch
+16:            continue                                                                                            expressions, which correspond to the initial and bound values of
+17:        if 𝑜𝑝 is LoadInst or InductionVariable then                                                             the induction variable, respectively. Second, Magellan unrolls the
+18:            store 𝑝𝑎𝑡ℎ in 𝑟𝑒𝑠𝑢𝑙𝑡𝑠                                                                               inner loop twice and compares the preheader from the first iteration
+19:        else                                                                                                    with the latch from the second iteration. The nested loop pattern is
+20:            store 𝑜𝑝 in 𝑝𝑎𝑡ℎ                                                                                    classified as irregular if they do not match. Otherwise, it analyzes
+21:            call analyze_dfs(𝑜𝑝)                                                                                the iteration condition of the outer loop: if the outer loop’s iteration
+                                                                                                                   condition is incremental, the nested loop pattern is identified as
+                                                                                                                   stream-in; if it is decremental, it is classified as stream-out.
+as a global IMA. For instance, in the BFS algorithm, traversing the                                                   With the nested loop pattern identified, the next step is to insert
+dependence graph allows Magellan to identify two local IMAs for                                                    the appropriate prefetch instructions.
+Offset and Visited, and one global IMA for Edgelist. Having detected
+all IMAs, Magellan uses the loop structures to implement efficient                                                  3.3      Prefetching Strategy
+prefetching strategies.                                                                                            The core idea behind our prefetch strategy is to aggressively prefetch
+                                                                                                                   potential nodes for both current and future loops. This approach is
+3.2          Nested-Loop Patterns                                                                                  based on the observation that, in sparse applications, inner loops
+3.2.1 Classification. In sparse and graph applications, nested loops                                               are interrelated—a concept captured by nested loop patterns—rather
+frequently handle indirect memory accesses. Based on this observa-                                                 than isolated. We implement three distinct prefetch strategies to ef-
+tion, we categorize these nested loop structures into three common                                                 ficiently handle IMAs with different nested loop patterns, as shown
+                                                                                                               5
+
+
+
+
+                                                                                                          605
+ISCA ’25, June 21–25, 2025, Tokyo, Japan                                                                    Gelin Fu, Tian Xia, Mingzhuo Yin, Prashant J. Nair, Mieszko Lis, and Pengju Ren
+
+
+                                                                                         Inner-loop direction            Outer-loop direction
+            Nested-loop                                                                                                                      Inner-outer       Representative
+                                                 Code example                                Memory traversal pattern for a[j]
+              pattern                                                                                                                      loop direction        workload
+                                 for(i=0;i<size;i++)                                     Outer loop-1
+                                    start, end = ptr[i], ptr[i+1]                        Outer loop-2                                                         SpMV, PageRank,
+                                    for(j=start;j<end;j++)                                                                                                      CC, DC, CG
+             Stream in                    load(x[a[j]])                                  Outer loop-3
+                                                                                                                                                Same
+                                         for(j=0;j<num;j++)                                                                                                         IS, HJ2,
+                                               load(x[a[j]])                                 Loop-1                                                                   HJ8
+
+                                  for(i=size;i>0;i--)                                    Outer loop-1
+                                     start, end = ptr[i], ptr[i+1]                       Outer loop-2
+            Stream Out               for(j=start;j<end;j++)                                                                                   Opposite              SYMGS
+                                          load(x[a[j]])                                  Outer loop-3
+
+                               for(i=1;i<size;i++)                  Outer loop-1
+                                  tmp = queue[i]
+              Irregular           start, end = ptr[tmp], ptr[tmp+1] Outer loop-2                                                               Irregular          BFS,SSSP,
+                                  for(j=start;j<end;j++)                                                                                                             BC
+                                                                    Outer loop-3
+                                      load(x[a[j]])
+
+Figure 8:Prefetch  strategy patterns for sparse applications: stream-in, stream-out, and irregular. Different colors represent
+          Three nested-loop
+different outer loops.
+
+        Prefetch strategy                   Inner-bound                          Inner-free                           Opposite inner-free                              Outer
+                                                                                                          for (i=size;i>0;i--)                        for (i=1;i<size;i++)
+                                   for (i=0;i<size;i++)            for (i=0;i<size;i++)                     start, end = ptr[i], ptr[i+1]
+                                     start, end = ptr[i], ptr[i+1]                                                                                      tmp = queue[i]
+                                                                     start, end = ptr[i], ptr[i+1]          for (j=start;j<end;j++)
+                                     for (j=start;j<end;j++)                                                    load(x[a[j]])                           start, end = ptr[tmp], ptr[tmp+1]
+                                                                     for (j=start;j<end;j++)
+                                          load(x[a[j]])                                                         if j+32 < end                           pref_offset = select_node(i+32)
+          Code example                                                    load(x[a[j]])                             pref_j = j+32
+                                          pref_j = min(j+32, end)                                                                                       pref_idx = a[pref_offset]
+                                                                          pref_j = j+32                         else
+                                          pref_idx = a[pref_j]                                                                                          prefetch(x[pref_idx])
+                                                                          pref_idx = a[pref_j]                      pref_j = min(0, start-(j+32-end))
+                                          prefetch(x[pref_idx])                                                 pref_idx = a[pref_j]                    for (j=start;j<end;j++)
+                                                                          prefetch(x[pref_idx])
+                                                                                                                prefetch(x[pref_idx])                        load(x[a[j]])
+
+        Prefetch position                     Inner loop                       Inner loop                               Inner loop                               outer loop
+
+          Prefetch scope                    Current loop              Current loop + future loop              Current loop + future loop                         Future loop
+      Instruction overhead                     High                             Medium                                    High                                      Low
+
+
+Figure 9: Four prefetch strategies for indirect memory access. Prefetch-related instructions are noted in red color. Different
+strategies target different prefetch scopes with different overheads, making them suitable for IMA with specific loop patterns.
+                    for (i=0; i<num; i++)
+                                                                 for (i=0; i<num; i++)
+  void kernel(int* ptr,offset,
+                          int* a,size = select_node(i);Step1: Search preheader and
+                                  int*x){                            offset, size = select_node(i);      in Fig. 9. Each strategy balances the exploitation of prefetch candi-
+                         pref_offset = select_node(i+32)
+                                                      latch variablefor
+                                                                      for(j=0;
+                                                                          the inner
+    for(i=0;i<row_size;i++)                                                    j<size;loop
+                                                                                        j++)             dates with additional instruction overhead, making it suitable for
+                         pref_idx
+     for(j=ptr[i];j<ptr[i+1];j++)
+                                    = a[pref_offset]
+                                                                         idx = a[offset+j]               specific nested loop scenarios.
+      preheader latch    prefetch(x[pref_idx])        preheader:  ptr[i]   latch: ptr[i+1]
+                      for (j=0; j<size; j++)
+         y[j] += x[a[j]];                                                load x[idx]                        For IMAs with the stream-in or stream-out nested loop patterns
+   }           IMA load idx = a[offset+j]            Step2: Unroll innerpref_j   = j+32and
+                                                                           loop twice
+                                                       compare latch and pref_idx   = a[offset+pref_j]
+                                                                             preheader
+                                                                                                         (see Fig.8), the inner-loop induction variable changes regularly
+               Source code  load x[idx]
+                                                                       prefetch(x[pref_idx])             between outer loop iterations. This regularity allows us to use the
+                                               loop-1: preheader: ptr[i]   latch: ptr[i+1]
+                                               loop-2: preheader: ptr[i+1] latch: ptr[i+2]
+                                                                                                         direction of the outer loop to predict node addresses in future loops
+                                                                                                         accurately. Accordingly, we select inner-free prefetching strategies
+                                                                                     false
+                                                                 Matching?                               for these patterns, generating prefetches for both current and future
+                                                                        true
+                                                           Step3: Detect iteration                       loops but in different ways. Since the inner loop shares the same
+                                                           condition of outer loop                       direction as the outer loop in the stream-in pattern, the out-of-loop
+                                         incremental            decremental
+                                                                                                         prefetch index j + pref_d yields useful requests for future loops.
+                                                                                                         Conversely, in the stream-out pattern, the inner loop moves in the
+                                            Stream-in           Stream-out            Irregular
+                                                                                                         opposite direction to the outer loop. To make out-of-loop prefetches
+Figure 10: Magellan takes three steps to detect three different                                          effective when j + pref_d exceeds the loop bound, we prefetch nodes
+nested loop patterns: stream-in, stream-out, and irregular.                                              in the reverse direction, resulting in the opposite inner-free strategy
+                                                                                                         shown in Fig.9.
+
+                                                                                                   6
+
+
+
+
+                                                                                               606
+Magellan: A High-Performance Loop-Guided Prefetcher for Indirect Memory Access                                                                 ISCA ’25, June 21–25, 2025, Tokyo, Japan
+
+
+ void kernel(int* ptr, int* a, int*x){   Step1: search expression for intermediate load a[j+pref_d]       violations: (1) analyze the farthest reachable element and (2) extend
+   for(i=0;i<row;i++)                                                                                     the memory allocation size of the array to hold this farthest access.
+     for(j=ptr[i];j<ptr[i+1];j++)          %17 = getelementptr inbounds i32, i32* %6, i64 %15
+        y[j] += x[a[j]];                   Pointer to a[j+pref_d]          BaseAddr Offset
+                                                                                                          There are two factors in this analysis. Consider the IMA code in
+               IMA load                                                                                   Fig.11. First, when the last loop iteration is running, and j accesses
+        prefetch(x[a[j+pref_d]]);                                                                         the last element of array a, now the prefetch load a[j+pref_d] will ex-
+ }              Intermediate load        Step2: Track related memory allocator using BaseAddr %6
+                                                                                                          ceed the array space. Second, branch misprediction deteriorates this
+ int main(){                                         define void @ kernel (i32* %6, i32* %7)              situation. Though speculative accesses on mispredicted paths are
+   int *a = malloc(size);                  Track     call fastcc void @ kernel (i32* %3, i32* %4)         not architecturally viable, recently advanced side-channel attacks
+   int *x = malloc(size);                            %3 = bitcast i8* %2 to i32*
+   ...                                               %2 = call i8* @malloc(i64 40000)                     [33, 44] demonstrate that load instructions on mispredicted paths
+   kernel(ptr, a, x);                                                                                     can be utilized to load illegal data into cache state and transferred by
+ }                                          Step3: Extend size parameter for memory allocation            cache-based convert-channels [48, 83]. Therefore, Magellan needs
+             Source code                                                                                  to ensure that loads on the mispredicted path also target the safe
+                                                     %2 = call i8* @malloc (i64 40000 +                   memory space. Because if the branch predictor mistakenly predicts
+                                                      prefetch_distance + rob_size)
+                                                                                                          the direction of the inner loop branch, j would increase mistakenly,
+Figure 11: Magellan identifies the memory allocation func-                                                and prefetched index j+pref_d would increase accordingly.
+tion associated with prefetched data structures and extends                                                   Second, our compiler pass tracks the allocation function asso-
+their storage space to avoid memory access violations.                                                    ciated with array a and extends its size accordingly, as shown
+                                                                                                          in Fig. 11. LLVM typically transforms the intermediate load a[j +
+   For irregular loop patterns, there are two alternative prefetch                                        pref_d] into a GetElementPtr (GEP) instruction in the form GEP
+strategies. On the one hand, inner-bound prefetching is commonly                                          {BaseAddress, Offset}. The BaseAddress variable refers to the array’s
+used to generate conservative prefetch for the current loop. How-                                         base address, and the Offset variable indexes into the array. We use
+ever, it only works well for code with large loop iteration counts                                        BaseAddress as a starting point and search backward through its
+when most prefetch indices will not exceed the loop boundary. On                                          preceding instructions by examining the source operands until we
+the other hand, outer prefetching inserts prefetch instructions in                                        locate the memory allocation function (e.g., malloc or calloc). We
+the outer loops, which attempt to prefetch for the future inner loop                                      then increase the size parameter by prefetch_distance + rob_size
+in advance. Its advantage is that prefetch can now use the whole                                          to ensure that each intermediate load a[j + pref_d] returns valid
+work from the inner iteration to overlap prefetch latency, result-                                        data. Since the data footprints of sparse applications are typically
+ing in timely prefetch. In sparse applications, where loop iteration                                      very large, the additional memory space consumed by Magellan is
+counts are small, we opt for outer prefetching for IMAs with ir-                                          negligible – averaging only 0.0036% of the total memory cost – as
+regular loop patterns. We provide a quantitative analysis of this                                         discussed in Section 5.6.
+strategy selection in Section 5.12.                                                                           To avoid out-of-bound memory accesses, our optimization is
+                                                                                                          applied only when the memory allocation site associated with the
+3.4       Avoiding Program Faults                                                                         prefetched load can be precisely identified and safely extended.
+Magellan modifies the original program’s code by explicitly insert-                                       Some programs may involve prefetched loads originating from
+ing prefetch-related instructions. Specifically, to perform an IMA                                        multiple pointers allocated via separate malloc() calls. In such cases,
+prefetch like x[a[j + pref_d]], Magellan inserts an intermediate load                                     if any allocation site cannot be accurately tracked, such as when
+for the index a[j + pref_d]. Although the prefetch instruction itself                                     prefetched data structures are allocated externally, our optimization
+is only a hint and will not cause faults on commercial CPUs [30, 47],                                     is not applied to preserve program correctness.
+this intermediate load is a demand request. It can introduce faults if                                        Specifically, we address external allocations by examining the
+it attempts to access memory out of bounds with an invalid index.                                         linkage type of functions to determine if they are externally callable
+                                                                                                          and by checking the attributes of prefetched data structures to see
+3.4.1 Naïve approach and limitations. A straightforward method to                                         if they are external variables. Another challenging scenario occurs
+prevent memory access violations is Software Fault Isolation (SFI)                                        when pointers propagate through memory. Here, our LLVM pass
+[72]. SFI adds explicit boundary checks for each intermediate load,                                       tracks memory dependencies using AliasSetTracker [74] and Domi-
+preventing safety violations. However, SFI significantly impacts                                          natorTreeAnalysis [17] from the LLVM framework. These analyses
+performance due to the additional instruction overhead. In our                                            help perform pointer aliasing and identify the last store operation
+evaluation of the SpMV application from the GAP benchmark suite                                           preceding the prefetched load. However, since our approach relies
+[13], SFI increased the dynamic instruction count by 31% on average                                       solely on static analysis, it may encounter difficulties in complex
+and degraded performance by 28%.                                                                          aliasing situations, such as pointer accesses that are conditional on
+                                                                                                          runtime branches. Additionally, our optimization deliberately ex-
+3.4.2 Observation: Memory violation occurs at the boundary. We
+                                                                                                          cludes calls to memcpy() and memmove() when the prefetched load
+observe that the intermediate load targets sequential access arrays,
+                                                                                                          targets a derived memory region, since these functions strictly copy
+and memory violations occur only at the array boundaries. There-
+                                                                                                          valid data and do not require extended sizes for prefetch safety.
+fore, we must ensure that the farthest access generated by this load
+instruction during runtime returns a valid value.
+3.4.3 Key mechanism: Estimating farthest reachable elements and
+extending allocation size. Magellan uses two steps to avoid memory
+                                                                                                      7
+
+
+
+
+                                                                                                 607
+                                                                        Prefetch potential
+ISCA ’25, June 21–25, 2025, Tokyo, Japan                                                                           Gelin Fu, Tian Xia, Mingzhuo Yin, Prashant J. Nair, Mieszko Lis, and Pengju Ren
+
+
+           Table 1: Evaluation platform configuration.                                                                                              Prefetchable        Non-prefetchable
+                                                                                                                   100%
+
+
+
+
+                                                                                              Cache miss
+          Architecture         AArch64       x86              x86                                                   80%
+          Platform             GEM5          Intel i5-7500    Intel E5-2660                                         60%
+          Processor            ARMv8         Kabylake         Sandy Bridge                                          40%
+          Frequency            2.5GHz        3.4GHz           2.2GHz                                                20%
+          L1 D-Cache           32KB          32KB             512KB                                                   0
+
+
+
+
+                                                                                                                                                                                                                     geomean
+                                                                                                                                                                         symgs
+
+
+
+
+                                                                                                                                                                                                           randacc
+                                                                                                                                                            cc
+
+
+
+
+                                                                                                                                                                                               hj2
+
+                                                                                                                                                                                                     hj8
+                                                                                                                                      bfs
+
+
+
+
+                                                                                                                                                                                    is
+
+                                                                                                                                                                                          cg
+                                                                                                                                                      bc
+
+
+
+                                                                                                                                                                   dc
+                                                                                                                                 pr
+
+
+                                                                                                                                             sssp
+                                                                                                                          spmv
+          L2 Cache             1MB           256KB            4MB
+          L3 Cache             /             6MB                Detection coverage
+                                                              40MB
+          Memory               16GB          16GB             192GB
+              Table 2: The kernels used in this study.                                        Figure 12: Classification of cache miss into two types:
+                                                                                              prefetchable (IMA miss) and non-prefetchable (other miss).
+                                  IMA type                Nested Loop Pattern
+ Benchmark        Source
+                                Local   Global    Stream-in   Stream-out    Irregular
+     SpMV        GAP [13]        ✓         ✓          ✓                                                                                             SW Prefetch     APT-GET              Magellan
+
+
+
+
+                                                                                              Detection coverage
+      PR         GAP [13]        ✓         ✓          ✓                                                            100%
+      BFS        GAP [13]        ✓         ✓          ✓                         ✓                                   80%
+     SSSP        GAP [13]        ✓         ✓          ✓                         ✓
+      BC         GAP [13]        ✓         ✓          ✓                         ✓                                   60%
+      CC         GAP [13]        ✓         ✓          ✓                                                             40%
+      TC         GAP [13]        ✓         ✓          ✓                         ✓                                   20%
+      DC       GraphBIG [58]     ✓         ✓          ✓
+                                                                                                                      0
+
+
+
+
+                                                                                                                                                                                         is
+
+                                                                                                                                                                                               cg
+                                                                                                                                                       bc
+
+
+
+                                                                                                                                                                    dc
+                                                                                                                                 pr
+
+
+
+                                                                                                                                               sssp
+                                                                                                                          spmv
+                                 ✓         ✓          ✓            ✓
+
+
+
+
+                                                                                                                                                                                 symgs
+
+
+
+
+                                                                                                                                                                                                                     randacc
+                                                                                                                                                             cc
+
+
+
+
+                                                                                                                                                                                                     hj2
+
+                                                                                                                                                                                                           hj8
+                                                                                                                                       bfs
+    SYMGS       HPCG [25]
+       IS         NAS [7]        ✓                    ✓
+      CG          NAS [7]        ✓         ✓          ✓
+      HJ2      HashJoin [11]     ✓                    ✓
+      HJ8      HashJoin [11]     ✓                    ✓
+   Randacc      HPCC [51]        ✓                    ✓
+                                                                                              Figure 13: Indirect pattern detection coverage for SW
+                                                                                              Prefetch [4], APT-GET [38] and Magellan.
+       Table 3: Real-world graph datasets for evaluation
+
+               Matrix             Vertices        Edges          Domain
+                                                                                              4.2                      Benchmarks
+           road_usa (RU)         23,947,347      57,708,624     Road Graph
+        com-liveJournal (CL)      3,997,962      69,362,378   Social Network                  We evaluate Magellan using 14 diverse benchmark applications
+          soc-pokec (SP)         1,632,803       30,622,564   Social Network                  spanning graph analytics, sparse linear algebra, and database do-
+          asia_osm (AO)          11,950,757      25,423,206   Street Network
+                                                                                              mains. This broad selection underscores the general applicability of
+4 Experimental Methodology                                                                    indirect memory access (IMA) patterns. Specifically, we use graph
+                                                                                              algorithms such as Sparse Matrix-Vector Multiplication (spmv),
+4.1 System Configurations                                                                     PageRank (pr), Breadth-First Search (bfs), Single-Source Short-
+We implement the Magellan prefetcher as an LLVM IR pass [45],                                 est Path (sssp), Betweenness Centrality (bc), Triangle Counting
+compatible with the Clang compiler. Table 1 summarizes the speci-                             (tc), Connected Components (cc), and Degree Centrality (dc),
+fications of the platforms used in our evaluation. We assess Magel-                           drawn from the GAP [13] and GraphBIG [58] benchmarks. Sparse
+lan’s effectiveness on two commercial hardware platforms: a client                            linear algebra applications include the Symmetric Gauss-Seidel
+platform featuring a 3.4 GHz Intel Core i5-7500 processor, and a                              Smoother (symgs) from HPCG [25] and RandomAccess (randacc)
+server platform equipped with a 2.2 GHz Intel Xeon E5-2660 pro-                               from HPCC [51]. Integer Sort (is) and Conjugate Gradient (cg),
+cessor. Both platforms support out-of-order execution along with                              relevant to computational fluid dynamics, are selected from the
+software and hardware prefetching mechanisms.                                                 NAS parallel benchmarks [7]. Database system behavior is repre-
+   We benchmark Magellan against three advanced software prefetch-                            sented by Hashjoin 2EPB (hj2) and Hashjoin 8EPB (hj8) from prior
+ing methods: SW Prefetch [4], APT-GET [38], and Intel OneAPI [65]                             studies [11]. Table 2 summarizes the indirect access and nested loop
+(version 2024.1). APT-GET, one of the latest profile-guided software                          patterns across these workloads. Real-world datasets from graph
+prefetchers, requires profiling input data for several minutes and                            collections [24], detailed in Table 3, are used for graph algorithms.
+recompiles the benchmarks using the collected profiling informa-                              For is and cg, we evaluate using the CLASS-B scale (33MB).
+tion to optimize prefetch parameters. The Intel OneAPI compiler
+improves application performance via automatic software prefetch                              5 Evaluation
+optimization enabled by the -qopt-prefetch option.
+   Additionally, we use the gem5 cycle-accurate simulator [15] to                             5.1 Prefetch Potential
+compare Magellan against four state-of-the-art hardware prefetch-                             We first evaluate the upper bound for the performance potential by
+ers: IPCP [66], Berti [61], IMP [84], and DMP [29], as well as one                            software prefetching to understand the capability of the ideal Mag-
+software-hardware co-designed prefetcher, Event-trigger [3]. The                              ellan prefetcher. Ideally, prefetch requests should cover all cache
+simulated system uses Intel Skylake parameters [26]. Performance                              misses resulting from indirect memory accesses, and the associated
+results exclude initialization costs, such as reading input graphs                            DRAM accesses would then become cache hits. We use Cachegrind
+and setting up data structures. For evaluations on actual hardware,                           [62] to evaluate the percentage of cache misses triggered by IMA
+algorithms execute for at least one minute to minimize initialization                         load instructions on the non-prefetching baseline. Fig. 12 shows
+overhead. In gem5 simulations, we use the region-of-interest (ROI)                            that, on average, 87.6% of total cache misses are IMA misses, which
+utility to isolate and profile only the core algorithmic execution.                           can be seen as potential candidates for the Magellan prefetcher.
+                                                                                          8
+
+
+
+
+                                                                                        608
+             Magellan: A High-Performance Loop-Guided Prefetcher for Indirect Memory Access                                           ISCA ’25, June 21–25, 2025, Tokyo, Japan
+
+
+){           for (auto q_iter = queue.begin(); q_iter < queue.end(); q_iter++) {                      Applications such as BFS, SSSP, and BC display similar perfor-
+                   NodeID u = *q_iter;                                                            mance trends, with Magellan achieving an average speedup of 1.2×
+r+1];j++){         for (NodeID v : g.out_neigh(u)) {
+                                                                                                  over the baseline. However, these applications involve more com-
+                           NodeID curr_val = parent[v];
+                                                                                                  plex indirect memory accesses (IMAs) and nested-loop patterns. For
+                           ...
+                                                                                                  example, in BFS, traversals of Offset demonstrate local IMAs with a
+                       }
+                   }                                                                              stream-in loop pattern, whereas traversals of Edgelist exhibit global
+                                                                                                  IMAs with irregular loop patterns due to dynamic vertex processing
+                                                                                                  order. Magellan strategically generates out-of-loop prefetches for
+             Figure 14: Global IMA of BFS code from GAP benchmark[13].
+                                                                                                  Offset and uses an outer-loop prefetching for data like Visited.
+                                                                                                      However, performance degradation is observed in some BC sce-
+             5.2       IMA Detection Coverage                                                     narios due to two primary reasons. First, BC involves significantly
+             First, effective prefetching requires accurately identifying the un-                 more complex IMAs, featuring 13 distinct indirection loads, which
+             derlying indirect memory access (IMA) patterns within programs.                      can lead to frequent prefetch insertions interfering with regular
+             Fig.13 compares the detection coverage of different prefetching tech-                memory requests. Second, static compiler-time prefetch scheduling
+             niques. All techniques demonstrate accurate detection for straight-                  struggles with complex access patterns, highlighting the potential
+             forward kernels such as IS, HJ2, and HJ8, where the IMA pattern                      benefits of a dynamic feedback-based system to fine-tune Magel-
+             appears in a simple, single-level loop structured as x[a[i]]. However,               lan’s prefetch strategy.
+             for more complex graph applications like bfs and sssp, SW Prefetch                       In contrast, TC achieves a modest speedup of 1.06× with Magel-
+             and APT-GET exhibit limited detection coverage, which reduces                        lan due to good data locality and frequent data reuse, making it more
+             their effectiveness in prefetching. As shown in Figure 14, these                     compute-bound than memory-bound. Analysis using VTune Pro-
+             graph applications frequently involve nested two-level loops: the                    filer reveals that only 15% of pipeline slots are impacted by memory
+             outer loop selects a vertex, and the inner loop iterates over all edges              latency, limiting prefetch benefits. The SYMGS application differs
+             connected to that vertex. SW Prefetch and APT-GET terminate their                    from others, featuring two runtime phases: forward incremental
+             backward search for loads such as parent[v] when encountering the                    traversal followed by backward traversal of matrix rows. Magellan
+             loop variable v, treating parent[v] as a stream load. However, the                   applies distinct inner-free prefetch strategies in each phase, effec-
+             loop variable v depends on the outer-loop variable u through the                     tively exploiting prefetch opportunities and achieving significant
+             loop’s iteration conditions. Magellan addresses this issue by explic-                speedups (1.2×). For simpler applications such as IS, CG, HJ2, and
+             itly analyzing iteration conditions and constructing dependency                      HJ8, Magellan and SW Prefetch both achieve notable performance
+             graphs across nested loops. This enables Magellan to capture cross-                  improvements due to IMAs typically appearing in straightforward,
+             loop dependencies, identifying the load of parent[v] as a global IMA                 single-level loops (e.g., x[a[i]]) with sufficient iteration counts for
+             and appropriately inserting indirect prefetch instructions.                          timely prefetch generation.
+                                                                                                      Finally, APT-GET [38] achieves an average speedup of 1.13×
+             5.3       Overall Performance                                                        over SW Prefetch [4] due to its profile-guided prefetch optimiza-
+             Fig.15 summarizes Magellan’s performance across all workloads                        tion. Nonetheless, Magellan still outperforms APT-GET by an aver-
+             on the Kabylake and Sandy Bridge platforms. Performance results                      age of 1.14× by leveraging deeper loop semantics. Incorporating
+             are presented as normalized speedups relative to the original code                   APT-GET’s profile-based tuning approach could further enhance
+             without software prefetching. On the Kabylake platform, Magellan                     Magellan’s performance by optimizing prefetch parameters across
+             achieves an average speedup (geomean) of 1.2×, with a maximum                        diverse applications.
+             of 2.5× compared to the baseline. On the Sandy Bridge platform,
+             Magellan achieves an average speedup of 1.1×, with a maximum of
+             1.6× observed in the hj8 application. Magellan generally provides                    5.4    Magellan versus Hardware Prefetchers
+             greater benefits on the client platform (Kabylake) compared to                       Beyond software prefetchers, we also compare Magellan with five
+             the server platform (Sandy Bridge). This difference likely arises                    state-of-the-art hardware prefetchers (i.e., IPCP [66], Berti [61],
+             from the server’s more aggressive memory hierarchy, characterized                    IMP [84], and DMP [29]) and one software-hardware co-designed
+             by higher associativity and larger cache sizes, which reduces the                    prefetcher named Event-trigger [3]. The key benefit of Magellan
+             number of cache misses.                                                              over hardware prefetchers is its ability to accommodate different
+                Applications such as SpMV, PR, CC, and DC exhibit significant                     program behaviors without additional hardware costs. Fig.18 shows
+             speedups with Magellan, achieving a geomean speedup of 1.2× and                      that Magellan outperforms the non-prefetching baseline by 1.7×
+             up to 1.4× compared to the baseline. These applications feature                      on average, compared with 1.8× speedup by the best of hardware
+             stream-in nested-loop structures, enabling Magellan to identify ad-                  prefetchers. The results show two observations. First, for most ap-
+             ditional prefetch opportunities by employing out-of-loop prefetch-                   plications, compared with the state-of-the-art hardware prefetchers,
+             ing strategies. Figure 16 illustrates that Magellan reduces cache                    Magellan achieves competitive performance improvements without
+             misses by an average of 89% compared to the baseline, whereas                        requiring any hardware changes to current processors. Second hj2,
+             SW Prefetch achieves only a 36% reduction due to its inner-bound                     hj8, randacc applications have more complicated IMA patterns
+             prefetch strategy. Additionally, Figure 17 shows that Magellan low-                  due to the hash function with the form of x[hash(a[i])]. For this type
+             ers normalized instruction counts from 45% to 29% compared to                        of IMA, it is difficult for hardware prefetchers to accurately detect
+             SW Prefetch, primarily by eliminating boundary checks.                               the IMA pattern, considering the various possible implementations
+                                                                                              9
+
+
+
+
+                                                                                          609
+            ISCA ’25, June 21–25, 2025, Tokyo, Japan                                                                                                                                       Gelin Fu, Tian Xia, Mingzhuo Yin, Prashant J. Nair, Mieszko Lis, and Pengju Ren
+
+
+
+                                                                                                                                                                                SW Prefetch                               Intel OneAPI             APT-GET          Magellan
+                                                                                                               1.6                   1.7                                                                                                                                                2.3 2.4 2.4
+                                 1.5
+                                       (a) KabyLake
+                                 1.0
+               Speedup
+
+
+
+
+                                 0.5
+
+                                  0
+                                                                                                               1.6                                                                                                                                                                        1.7 1.71.7
+                                 1.5 (b) Sandy Bridge
+
+                                 1.0
+               Speedup
+
+
+
+
+                                 0.5
+
+                                  0
+                                   spmv-ru
+
+
+
+
+                                                  pr-ru
+
+
+
+
+                                                                                            bfs-ru
+
+
+
+
+                                                                                                              sssp-ru
+
+
+
+
+                                                                                                                                         bc-ru
+
+
+
+
+                                                                                                                                                                            cc-ru
+
+
+
+
+                                                                                                                                                                                                                      tc-ru
+
+
+
+
+                                                                                                                                                                                                                                           dc-ru
+
+
+
+
+                                                                                                                                                                                                                                                        symgs
+
+
+
+
+                                                                                                                                                                                                                                                                                            randacc
+                                               spmv-ao
+
+
+
+
+                                                                                    pr-ao
+
+
+
+
+                                                                                                               bfs-ao
+
+
+
+
+                                                                                                                           sssp-ao
+
+
+
+
+                                                                                                                                                                  bc-ao
+
+
+
+
+                                                                                                                                                                                                                     cc-ao
+
+
+
+
+                                                                                                                                                                                                                                           tc-ao
+
+
+
+
+                                                                                                                                                                                                                                                         dc-ao
+
+
+
+
+                                                                                                                                                                                                                                                                                                hj2
+                                                                                                                                                                                                                                                                                                hj8
+
+                                                                                                                                                                                                                                                                                           geomean
+                                               spmv-sp
+
+
+
+
+                                                                            pr-sp
+
+
+
+
+                                                                                                     bfs-sp
+
+
+
+
+                                                                                                                           sssp-sp
+
+
+
+
+                                                                                                                                                 bc-sp
+
+
+
+
+                                                                                                                                                                            cc-sp
+
+
+
+
+                                                                                                                                                                                                                                tc-sp
+
+
+
+
+                                                                                                                                                                                                                                                         dc-sp
+
+
+
+                                                                                                                                                                                                                                                                                is
+                                                                                                                                                                                                                                                                               cg
+                                                spmv-cl
+
+
+
+
+                                                                    pr-cl
+
+
+
+
+                                                                                            bfs-cl
+
+
+
+
+                                                                                                                            sssp-cl
+
+
+
+
+                                                                                                                                                  bc-cl
+
+
+
+
+                                                                                                                                                                             cc-cl
+
+
+
+
+                                                                                                                                                                                                                                 tc-cl
+
+
+
+
+                                                                                                                                                                                                                                                          dc-cl
+            Figure 15: SW Prefetch [4], Intel OneAPI [65], APT-GET [38] and Magellan performance on Kabylake (top) and Sandy Bridge
+            (bottom). Performance is normalized to the baseline with no software prefetcher.
+
+                                                                    SW Prefetch               APT-GET                Magellan                                                                                      IPCP     Berti       IMP      SW Prefetch            Event-trigger       DMP        Magellan
+                                 100%
+             Prefetch coverage
+
+
+
+
+                                                                                                                                                                                                  3                                                     6.7 4.4 4.1 4.5 5.6 4.2 4.3
+                                  80%
+                                  60%
+                                                                                                                                                                                                  2
+                                                                                                                                                                          Speedup
+
+
+
+                                  40%
+                                  20%                                                                                                                                                             1
+                                    0
+                                                                                                   symgs
+                                             spmv
+
+
+
+
+                                                                                                                                           randacc
+                                                      pr
+                                                            bfs
+                                                                   sssp
+                                                                            bc
+
+
+                                                                                             dc
+                                                                                     cc
+
+
+
+
+                                                                                                                            hj2
+                                                                                                                                   hj8
+
+
+                                                                                                                                                       geomean
+                                                                                                              is
+                                                                                                                     cg
+
+
+
+
+                                                                                                                                                                                                  0
+                                                                                                                                                                                                                          bfs
+
+                                                                                                                                                                                                                                 sssp
+
+                                                                                                                                                                                                                                           bc
+
+
+
+                                                                                                                                                                                                                                                        dc
+                                                                                                                                                                                                                                                   cc
+
+
+
+
+                                                                                                                                                                                                                                                                                          hj2
+
+                                                                                                                                                                                                                                                                                                 hj8
+
+
+
+                                                                                                                                                                                                                                                                                                                    geomean
+                                                                                                                                                                                                                                                                          is
+
+                                                                                                                                                                                                                                                                                cg
+                                                                                                                                                                                                                                                                symgs
+                                                                                                                                                                                                           spmv
+
+
+
+
+                                                                                                                                                                                                                                                                                                        randacc
+                                                                                                                                                                                                                    pr
+
+
+
+
+            Figure 16: Prefetch coverage by SW Prefetch, APT-GET and
+plication   Magellan.
+                                                                                                                                            Figure 18: Performance of Magellan, SW Prefetch and five
+                                                                                     SW Prefetch               Magellan                     state-of-the-art hardware prefetchers over non-prefetching
+                                       2.0                                                                                          Memory bandwidth
+               Normalized dynamic
+                instruction count
+
+
+
+
+                                                                                                                                            baseline.
+                                       1.5
+                                                                                                                                                                                                                                                No prefetch             Magellan                        13.2
+                                       1.0                                                                                                                                                         12
+                                                                                                                                                                          DRAM bandwidth (GB/s)
+
+
+
+
+                                       0.5                                                                                                                                                         10
+                                                                                                                                                                                                    8
+                                           0
+                                                                                                                                                                                                    6
+                                                             bfs
+                                                                    sssp
+                                                                             bc
+
+
+                                                                                              dc
+                                                                                       cc
+
+
+
+
+                                                                                                                             hj2
+                                                                                                                                   hj8
+
+
+                                                                                                                                                       geomean
+                                                                                                               is
+                                                                                                                      cg
+                                                                                                     symgs
+                                               spmv
+
+
+
+
+                                                                                                                                           randacc
+                                                       pr
+
+
+
+
+                                                                                                                                                                                                    4
+                                                                                                                                                                                                    2
+                                                                                                                                                                                                    0
+                                                                                                                                                                                                             spmv
+
+
+
+
+                                                                                                                                                                                                                                                                                                        randacc
+                                                                                                                                                                                                                           bfs
+                                                                                                                                                                                                                                    sssp
+                                                                                                                                                                                                                                           bc
+
+
+                                                                                                                                                                                                                                                         dc
+                                                                                                                                                                                                                                                   cc
+
+
+
+
+                                                                                                                                                                                                                                                                                          hj2
+                                                                                                                                                                                                                                                                                                hj8
+
+
+                                                                                                                                                                                                                                                                                                                   geomean
+                                                                                                                                                                                                                                                                           is
+                                                                                                                                                                                                                                                                                 cg
+                                                                                                                                                                                                                                                                symgs
+                                                                                                                                                                                                                     pr
+
+
+
+
+            Figure 17: Dynamic instruction count of SW Prefetch and
+            Magellan. Results normalized to non-prefetching baseline.
+                                                                          Sam prefetch                  CFG prefetch
+            of 100%
+               the hash function, which results in a restricted performance                                                                                           Figure 19: Memory bandwidth by no-prefetch and Magellan.
+            speedup.
+                80% In contrast, Magellan uses knowledge about program be-                                                                                            [31] that dumps prefetching requests based on bandwidth usage
+            Extra inst. count
+
+
+
+
+                                                                                                                                                                                                 Non-prefetch
+            havior
+                60%and data distribution at compile time to accurately detect
+                                                                                                                                                                      as feedback
+                                                                                                                                                                           10
+                                                                                                                                                                                  can improve this  situation. Second,CFG prefetch
+                                                                                                                                                                                                                       Magellan    does not
+                                                                                                                                                                                   DRAM bandwidth (GB/s)
+
+
+
+
+            this complicated IMA pattern.                                                                                                                             impose significant extra pressure on the memory bandwidth, which
+                                 40%                                                                                                                                        8
+                                                                                                                                                                      means that most prefetching requests turn into useful memory
+                                                                                                                                                                            6
+            5.520%Memory Bandwidth Usage                                                                                                                              accesses for demand loads. Therefore, with highly accurate detec-
+                                       0                                                                                                                                    4 generation of most indirect patterns, Magellan greatly
+                                                                                                                                                                      tion and
+            To further evaluate Magellan’s effect on memory optimization,
+                                                              bfs
+
+                                                                          sssp
+
+                                                                                    bc
+
+
+
+                                                                                                       dc
+                                                                                              cc
+
+
+
+
+                                                                                                                                             geomean
+                                                                                                                            is
+
+                                                                                                                                   cg
+                                                                                                                   symgs
+                                             spmv
+
+                                                       pr
+
+
+
+
+                                                                                                                                                                            2
+                                                                                                                                                                      improves  memory access efficiency, which explains its significant
+            Fig.19 depicts the DRAM bandwidth usage of Magellan, which
+            slightly boosts bandwidth, reaching an average of 1.1× bandwidth                                                                                                0 from the computer system’s perspective.
+                                                                                                                                                                      speedup
+                                                                                                                                                                                                                                                              cc
+
+
+
+
+                                                                                                                                                                                                                                                                                             is
+                                                                                                                                                                                                                                                                                  symgs
+                                                                                                                                                                                                                  spmv
+
+                                                                                                                                                                                                                          pr
+
+                                                                                                                                                                                                                                  bfs
+
+                                                                                                                                                                                                                                            sssp
+
+                                                                                                                                                                                                                                                    bc
+
+
+
+                                                                                                                                                                                                                                                                          dc
+
+
+
+
+                                                                                                                                                                                                                                                                                                                  geomean
+                                                                                                                                                                                                                                                                                                       cg
+
+
+
+
+            than the non-prefetching baseline. This result shows two observa-
+            tions. First, prefetching insertion indeed increases memory band-                                                                                         5.6                                    Memory Storage Cost
+            width, and performance improvement is a trade-off that comes at                                                                                           Magellan ensures that the addresses of intermediate loads always
+            the cost of consuming more bandwidth. An adaptive mechanism                                                                                               return valid values by explicitly expanding the size of the relevant
+                                                                                                                                                                 10
+
+
+
+
+                                                                                                                                                          610
+                                                           Outer pf degree
+  Magellan: A High-Performance Loop-Guided Prefetcher for Indirect Memory Access                                                                                                                                     ISCA ’25, June 21–25, 2025, Tokyo, Japan
+
+
+                                            Prefetch for future loop             Prefetch for current loop                                                               Degree = 1                   Degree = 4                  Degree = 8                 Degree = 16
+                 100%
+                                                                                                                                                                                                            1.6                                                        1.6
+                                                                                                                                                       1.5
+   Prefetch ratio
+
+
+
+
+                     80%
+
+
+
+
+                                                                                                                                             Speedup
+                     60%
+                                                                                                                                                       1.0
+                     40%
+                                                                                                                                                       0.5
+
+                                                                                                   Bound+global ima performan
+                     20%
+                           0                                                                                                                               0
+
+
+
+
+                                                                                        is
+                                                                             symgs
+                               spmv
+
+
+
+
+                                                                                                                 randacc
+                                      pr
+                                           bfs
+                                                 sssp
+                                                          bc
+
+
+                                                                     dc
+                                                                cc
+
+
+
+
+                                                                                                   hj2
+                                                                                                          hj8
+
+
+                                                                                                                              geomean
+                                                                                             cg
+
+
+
+
+                                                                                                                                                                            bfs-ru
+
+
+
+
+                                                                                                                                                                                                       bfs-sp
+
+
+
+
+                                                                                                                                                                                                                                             sssp-ru
+
+
+
+
+                                                                                                                                                                                                                                                                        sssp-sp
+                                                                                                                                                                                           bfs-cl
+
+
+
+
+                                                                                                                                                                                                                                                        sssp-cl
+                                                                                                                                                                bfs-wg
+
+
+
+
+                                                                                                                                                                                                                  bfs-ao
+
+                                                                                                                                                                                                                                sssp-wg
+
+
+
+
+                                                                                                                                                                                                                                                                                   sssp-ao
+  Figure 20: Classification of prefetch requests issued by Mag-                                                                              Figure 22: Performance of Magellan with different outer-
+  ellan into targeting   future loop andPrefetch
+                  Prefetch for future loop
+                                           target for
+                                                   current     loop.
+                                                      current loop
+                                                                                                                                             prefetch degrees. Results are normalized to no-prefetch.
+              100%
+    Prefetch ratio
+
+
+
+
+               80%
+               60%
+                                                 Magellan        Magellan + hardware prefetchers                                                       No optimized prefetch                  Eliding bound check               Eliding bound check+Global IMA prefetch
+               2.0
+               40%                                                                                                                                                                                                                                 2.3 2.4 2.4
+Speedup
+
+
+
+
+               1.5
+               20%                                                                                                                                        1.5
+                  0
+                     1.0
+
+
+
+
+                                                                                                                                                Speedup
+                               spmv
+
+
+
+
+                                                                                symgs
+                                                                cc
+
+
+
+
+                                                                                                                           randacc
+                                                                                                         hj2
+
+                                                                                                                hj8
+                                           bfs
+
+
+
+
+                                                                                         is
+
+                                                                                               cg
+                                                           bc
+
+
+
+                                                                        dc
+                                      pr
+
+
+
+                                                  sssp
+
+
+
+
+                                                                                                                                                          1.0
+                     0.5
+                      0                                                                                                                                   0.5
+                               spmv        pr            bfs     sssp           bc            cc           dc         symgs
+                                                                                                                                                           0
+
+
+
+
+                                                                                                                                                                                                                                    symgs
+
+
+
+
+                                                                                                                                                                                                                                                                                    randacc
+                                                                                                                                                                                                                cc
+
+
+
+
+                                                                                                                                                                                                                                                                  hj2
+
+                                                                                                                                                                                                                                                                             hj8
+                                                                                                                                                                                     bfs
+
+
+
+
+                                                                                                                                                                                                                                              is
+
+                                                                                                                                                                                                                                                       cg
+                                                                                                                                                                                                       bc
+
+
+
+                                                                                                                                                                                                                           dc
+                                                                                                                                                                          pr
+
+
+
+                                                                                                                                                                                              sssp
+                                                                                                                                                                spmv
+  Figure 21: Performance of Magellan with hardware prefetch-
+  ers disabled and enabled.
+                                                                                                                                             Figure 23: Effect of eliding bound check and global IMA
+  data structures. The size of the extended space is proportional to                                                                         prefetch on Magellan’s overall performance.
+  three factors: the number of IMAs (max number in our evaluation is
+  13 for bc application), the ROB size (224/168 for Kabylake / Sandy-                                                                                                    Inner-bound                 Inner-free            Outer             Opposite inner-free
+  Bridge), and the prefetch look-ahead distance (set as 32 in Magellan                                                                            1.5                                          100%                                         1.5
+  configuration). The cost of extended memory storage is negligible
+                                                                                                                                                  1.0                                                                                       1.0
+  because sparse applications typically have large data sets, much                                                                                                                                  50%
+                                                                                                                                                  0.5                                                                                       0.5
+  larger than the LLC size. We estimate the average storage cost per
+  application is 1486 Bytes (0.0036% of total memory on average).                                                                                      0                                              0                     0
+                                                                                                                                                                 (a) Speedup                          (b) Prefetch coverage (c) Instruction Count
+
+  5.7                      Prefetch Target Analysis                                                                                          Figure 24: (a) Speedup, (b) prefetching coverage, and (c) dy-
+                                                                                                                                             namic instruction count for different prefetching strategies
+  To better understand how Magellan exploits the prefetch opportu-
+                                                                                                                                             for IMA with stream-out loop pattern.
+  nity, Fig. 20 classifies the prefetch requests issued by Magellan into
+  two types: targeting the current loop and targeting the future loop.
+  Overall, this figure reveals that Magellan generates prefetches from                                                                       configurations. This disparity arises from variations in the num-
+  both the current loop and the future loop, but its behavior differs                                                                        ber of memory requests issued by different prefetching degrees,
+  across different applications. For sparse and graph applications, due                                                                      resulting in varying levels of instruction overhead. Second, in the
+  to the sparse distribution of data input, most loops have a small                                                                          sssp application with the com-LiveJournal(cl) dataset, a prefetching
+  iteration count. In this case, Magellan focuses on prefetching can-                                                                        degree of 4 yields the highest performance. Nevertheless, since
+  didates from the future loop to boost performance. In contrast, for                                                                        most scenarios attain optimal results with a prefetching degree of
+  applications with a large iteration count, such as is and cg, Magellan                                                                     1, we adopt degree=1 in our design, providing a balanced trade-off
+  mainly exploits prefetch candidates from the current loop.                                                                                 between coverage and instruction overhead.
+
+  5.8                      Influence of the Hardware Prefetcher                                                                              5.10                Effect: Bound Checks and Global IMA Prefetch
+  Fig.21 presents the speedups of Magellan to a non-prefetching                                                                              To analyze the effects of different optimizations on Magellan’s over-
+  baseline with different hardware prefetcher configurations. We                                                                             all performance, we design three comparative schemes: (a) non-
+  can observe that hardware prefetchers further improve Magellan’s                                                                           optimized prefetching, (b) prefetching with bound-check-removing,
+  performance by 1.13× on average. The reason is that using Magellan                                                                         (c) prefetching with bound-check-removing and global IMA prefetch.
+  and hardware prefetchers together can help cover a broader range                                                                           Fig. 23 shows the comparison results. First, prefetching without
+  of access patterns. Specifically, hardware prefetchers cover regular                                                                       any optimization only provides limited speedup, and for sparse
+  stream accesses, and Magellan covers irregular indirect accesses.                                                                          applications(e.g., spmv), it even causes a slowdown. These applica-
+                                                                                                                                             tions consume extra instructions to generate prefetch requests, but
+  5.9                      Outer-Prefetching Degree                                                                                          most of them are bounded by loop boundaries. Removing bound
+  Figure 22 illustrates the impact of different outer-prefetching de-                                                                        checks increases the performance by 11% because it removes bound
+  grees on overall performance, normalized to a baseline without                                                                             check instructions and exploits more prefetch potentials. More-
+  prefetching. Two key observations emerge: first, there can be up                                                                           over, global IMA prefetch can further increase 15% performance for
+  to a 40% performance gap between the best and worst prefetching                                                                            graph applications by identifying more prefetch candidates.
+                                                                                                                                        11
+
+
+
+
+                                                                                                                                     611
+ISCA ’25, June 21–25, 2025, Tokyo, Japan                                                                                    Gelin Fu, Tian Xia, Mingzhuo Yin, Prashant J. Nair, Mieszko Lis, and Pengju Ren
+
+
+                                  Inner-bound prefetching                Outer prefetching                                                          2-core     4-core    8-core   16-core
+                                                                                                                            16
+          1.5                                                    1.5
+                 (a)                                                     (b)
+
+
+
+
+                                                 instruction count
+
+
+
+
+                                                                                                                  Speedup
+                                                                                                                             8
+Speedup
+
+
+
+
+          1.0                                                    1.0
+
+
+
+
+                                                      Dynamic
+                                                                                                                             4
+          0.5                                                    0.5
+                                                                                                                             2
+             0                                                       0                                                       1
+                 bfs-ru
+
+                bfs-sp
+
+
+               sssp-ru
+
+              sssp-sp
+                 bfs-cl
+
+
+
+
+               sssp-cl
+                bfs-wg
+
+
+
+
+                bfs-ao
+              sssp-wg
+
+
+
+
+              sssp-ao
+             geomean
+
+
+
+
+                                                                             bfs-ru
+
+                                                                            bfs-sp
+
+
+                                                                           sssp-ru
+
+                                                                          sssp-sp
+                                                                            bfs-wg
+
+
+
+
+                                                                            bfs-ao
+                                                                          sssp-wg
+
+
+
+
+                                                                          sssp-ao
+                                                                         geomean
+
+
+
+
+                                                                                                                                              bfs
+
+
+
+                                                                                                                                                             bc
+
+
+
+                                                                                                                                                                           dc
+                                                                                                                                                                    cc
+
+
+
+
+                                                                                                                                                                                          is
+
+                                                                                                                                                                                                 cg
+                                                                                                                                                                                  symgs
+                                                                             bfs-cl
+
+
+
+
+                                                                           sssp-cl
+
+
+
+
+                                                                                                                                  spmv
+
+
+
+
+                                                                                                                                                                                                           randacc
+                                                                                                                                         pr
+
+
+
+                                                                                                                                                      sssp
+Figure 25: Performance (a) and dynamic instruction count (b)                                                      Figure 27: Performance of Magellan for 2 to 16-core system.
+of two different prefetch strategies for IMA with irregular                                                       Results are normalized to a 1-core system with Magellan.
+nested loop patterns.
+                                                                                                                                                 SW prefetch       APT-GET         Magellan
+                                                                                                                            1.5
+                       Kabylake       Sandbridge                          Skylake              Coffeelake
+
+
+
+
+                                                                                                                  Speedup
+          100%                                                                                                              1.0
+           80%
+Percentage
+
+
+
+
+           60%                                                                                                              0.5
+           40%
+                                                                                                                             0           1             2              4               8               16
+           20%
+             0                                                                                                                                                 Core number
+                  BFS SSSP BC      BFS SSSP BC                       BFS SSSP       BC       BFS SSSP BC
+                                                                                                                  Figure 28: Multi-core Speedups of SW Prefetch, APT-GET,
+Figure 26: Percentage of matrices in which using outer                                                            and Magellan on spmv over non-prefetching baseline.
+prefetching helps outperform inner prefetching. We test ma-
+trices that have more than 10 million non-zero values from
+SuiteSparse[24].
+                                                                                                                  5.13              A Discussion on Scalability
+                                                                                                                  To see whether Magellan continues to provide performance benefits
+                                                                                                                  as the number of cores increases, we experimented with Magellan,
+                                                                                                                  ranging from 2 to 16 cores. Performance is normalized to a 1-core
+5.11              Strategy Selection for Stream-out Loop                                                          system with Magellan prefetcher. As shown in Fig. 27, the perfor-
+The stream-out loop pattern is unique, featuring opposite directions                                              mance of Magellan improves as the number of cores increases. For
+for the inner loop and outer loop. We measure the performance                                                     example, the performance of spmv for eight cores achieves nearly
+of IMA in stream-out loops for symgs application with different                                                   7.2× speedup compared to the performance of 1 core. In addition,
+prefetching strategies. As shown in Fig.24(a), the opposite inner-                                                we observe that increasing the number of cores to around 16 has a
+free strategy achieves the highest speedup of 1.3× normalized to                                                  significant performance drop compared to the 1-core system. This
+no-prefetch baseline. This is because the opposite inner-free strat-                                              performance drop can be mainly attributed to the increasing con-
+egy distinguishably generates prefetches targeting the current and                                                tention in DRAM memory bandwidth, which introduces longer
+future loops, resulting in the best prefetch coverage in Fig.24(b).                                               DRAM access latencies. In that case, Magellan should adjust its
+Besides, it only costs a reasonable extra instruction overhead com-                                               prefetch aggressiveness by reducing prefetch levels and degrees,
+pared with other strategies in Fig.24(c). Thus, our design uses an                                                which is the future direction of this study.
+opposite inner-free strategy to prefetch IMAs in stream-out loops.                                                   Fig.28 shows speedups of different software prefetchers from 1
+                                                                                                                  to 16 cores on spmv application. Overall, Magellan outperforms
+5.12              Prefetch for Irregular Nested Loop Patterns                                                     competing prefetchers on systems with different core numbers.
+Two alternative strategies for prefetching IMA with an irregular                                                  Besides, in the 16-core system, the performance gap between APT-
+nested loop pattern are inner-bound prefetching and outer prefetch-                                               GET and Magellan becomes smaller because the per-core available
+ing, which focus on the prefetch opportunity for each current loop                                                DRAM bandwidth decreases, limiting the prefetch benefits.
+and future loop individually. Fig. 25(a) compares the performance of
+the inner-bound and outer prefetching strategies. In general, outer                                               6           Related Work
+prefetching outperforms inner-bound prefetching by 1.2× on aver-                                                  Indirect memory accesses are widely deployed in several applica-
+age. In addition, we also compare the instruction overhead of these                                               tion domains, including graph analytics [2], machine learning [20],
+two strategies relative to the non-prefetching baseline, as shown                                                 High-Performance Computing [50], and Warehouse-Scale (WSC)
+in Fig. 25 (b). Because inner-bound prefetching performs prefetch                                                 applications [39]. Many important classes of algorithms, including
+for every inner-loop iteration, it incurs 15% more instructions than                                              graph algorithms (e.g., GAP benchmark [13]), machine learning(e.g.,
+outer prefetching. We further test outer and inner prefetching on                                                 sparse CNN [34] , graph neural network [42]), HPC (e.g., global dot
+applications with irregular loop patterns (bfs,sssp,bc) using all                                                 products, sparse triangular solve [25]), WSC [39] (e.g. web search,
+matrices that have more than 10 million non-zeros from the SuiteS-                                                knowledge graph) and general-purpose applications (e.g., mcf in
+parse collection [24] (a total of 209) on four different machines.                                                SPEC CPU2006 [32]) share this kind of memory access pattern. De-
+As shown in Fig. 26, the outer prefetching strategy yields better                                                 spite their prevalence, current commercial CPUs offer suboptimal
+speedups on most matrices across different machines. Thus, we use                                                 performance that can be further improved [63, 81]. This section
+the outer prefetching strategy for irregular IMA patterns.                                                        discusses works that alleviate this memory bottleneck.
+                                                                                                             12
+
+
+
+
+                                                                                                            612
+Magellan: A High-Performance Loop-Guided Prefetcher for Indirect Memory Access                                                    ISCA ’25, June 21–25, 2025, Tokyo, Japan
+
+
+Software prefetching uses the compiler to analyze the source code                     Acknowledgments
+and insert prefetch instructions statically [5]. Previous work in soft-               We thank the shepherd and anonymous reviewers for their valuable
+ware prefetching targets simple access patterns such as streaming                     comments and feedback. This research was supported in part by
+or stride access [54]. More recently, several works have targeted                     the National Key Research and Development Program of China
+more complex access patterns, such as pointer chasing, hash join,                     (No. 2022YFB4500500), the National Natural Science Foundation
+and link data structures [19, 40, 49, 71], but not the indirect mem-                  of China (No. 62302381 and 62088102), and funding from the Lab-
+ory access patterns discussed in this paper. Recently, three new                      oratory for Advanced Computing and Intelligence Engineering.
+compiler techniques for indirection patterns have been proposed:                      The authors from Xi’an Jiaotong University are affiliated with the
+SW Prefetch [4], APT-GET [38], and RPG2 [85]. Because they do                         State Key Laboratory of Human-Machine Hybrid Augmented In-
+not efficiently leverage control flow behavior, they have limited                     telligence, the National Engineering Research Center for Visual
+applicability for sparse applications with combinations of differ-                    Information and Applications, and the Institute of Artificial Intelli-
+ent indirection patterns. Compared to SW Prefetch, APT-GET, and                       gence and Robotics. Tian Xia is also affiliated with Laboratory for
+RPG2 , these use runtime information to optimize prefetcher param-                    Advanced Computing and Intelligence Engineering, Wuxi, China.
+eters, such as prefetch distance, differently. APT-GET uses the Perf                  Additionally, Prashant J. Nair and Mieszko Lis acknowledge support
+tool to perform profiling and recompile the program accordingly. In                   from Canada’s Natural Sciences and Engineering Research Coun-
+contrast, RPG2 uses the BOLT [67] tool to dynamically rewrite the                     cil Discovery Grants RGPIN-2019-05059 and RGPIN-2023-05380,
+binary file and tune the prefetch parameters. These mechanisms                        respectively.
+can be applied to our design to boost performance further.
+Hardware prefetching uses dedicated hardware to detect pre-
+assumed memory access patterns and issue prefetching requests                         References
+                                                                                       [1] Junwhan Ahn, Sungpack Hong, Sungjoo Yoo, Onur Mutlu, and Kiyoung Choi.
+in advance to hide the memory latency. The hardware implicitly                             2015. A scalable processing-in-memory accelerator for parallel graph process-
+manages hardware prefetching, and for this reason, it is also called                       ing. In Proceedings of the 42nd Annual International Symposium on Computer
+automatic prefetching. Hardware prefetchers are more challenging                           Architecture. 105–117.
+                                                                                       [2] Sam Ainsworth and Timothy M Jones. 2016. Graph prefetching using data
+to implement than software approaches because they detect target                           structure knowledge. In Proceedings of the 2016 International Conference on Su-
+access patterns at runtime without software assistance. The predic-                        percomputing. 1–11.
+tion of hardware prefetchers usually attempts to capture regular                       [3] Sam Ainsworth and Timothy M Jones. 2018. An event-triggered programmable
+                                                                                           prefetcher for irregular workloads. ACM Sigplan Notices 53, 2 (2018), 578–592.
+spatial [6, 9, 14] or temporal [8, 37, 41, 52, 78, 79] history patterns,               [4] Sam Ainsworth and Timothy M Jones. 2019. Software prefetching for indi-
+which are not applicable for workloads with irregular indirection                          rect memory accesses: A microarchitectural perspective. ACM Transactions on
+                                                                                           Computer Systems (TOCS) 36, 3 (2019), 1–34.
+accesses. Specialized IMA hardware prefetchers such as IMP [84]                        [5] Grant Ayers, Heiner Litz, Christos Kozyrakis, and Parthasarathy Ranganathan.
+and DMP [29] require additional custom logic to detect and prefetch                        2020. Classifying memory access patterns for prefetching. In Proceedings of the
+complex indirection patterns.                                                              Twenty-Fifth International Conference on Architectural Support for Programming
+                                                                                           Languages and Operating Systems. 513–526.
+Runahead [57, 59, 60] utilizes the CPU’s memory stall time to                          [6] Jean-Loup Baer and Tien-Fu Chen. 1991. An effective on-chip preloading scheme
+prefetch useful data. Recently, Vector Runahead [59] has been pro-                         to reduce data access penalty. In Proceedings of the 1991 ACM/IEEE conference on
+posed to target indirect memory access, which speculatively re-                            Supercomputing. 176–186.
+                                                                                       [7] David H Bailey, Eric Barszcz, Leonardo Dagum, and Horst D Simon. 1993. NAS
+orders scalar operations in vector format to prefetch multiple in-                         parallel benchmark results. IEEE Parallel & Distributed Technology: Systems &
+direct accesses in parallel. However, unlike software prefetching                          Applications 1, 1 (1993), 43–51.
+                                                                                       [8] Mohammad Bakhshalipour, Pejman Lotfi-Kamran, and Hamid Sarbazi-Azad. 2018.
+techniques, runahead execution requires heavy modification of the                          Domino temporal data prefetcher. In 2018 IEEE International Symposium on High
+CPU core design, which limits its applicability in commercial CPUs.                        Performance Computer Architecture (HPCA). IEEE, 131–142.
+Graph accelerators [1, 12, 55, 56, 69, 70] have also been pro-                         [9] Mohammad Bakhshalipour, Mehran Shakerinava, Pejman Lotfi-Kamran, and
+                                                                                           Hamid Sarbazi-Azad. 2019. Bingo spatial data prefetcher. In 2019 IEEE Inter-
+posed, using pipelining data [55, 69], intelligent caching [12, 56],                       national Symposium on High Performance Computer Architecture (HPCA). IEEE,
+and near/in-memory processing [1, 70], to improve memory access.                           399–411.
+These architectures can use our prefetcher to enhance performance.                    [10] Vignesh Balaji, Neal Crago, Aamer Jaleel, and Brandon Lucia. 2021. P-opt: Prac-
+                                                                                           tical optimal cache replacement for graph analytics. In 2021 IEEE International
+                                                                                           Symposium on High-Performance Computer Architecture (HPCA). IEEE, 668–681.
+                                                                                      [11] Cagri Balkesen, Jens Teubner, Gustavo Alonso, and M Tamer Özsu. 2013. Main-
+7    Conclusions                                                                           memory hash joins on multi-core CPUs: Tuning to the underlying hardware.
+                                                                                           In 2013 IEEE 29th International Conference on Data Engineering (ICDE). IEEE,
+We introduced Magellan, a loop-guided software prefetcher for in-                          362–373.
+direct memory accesses (IMAs) in irregular applications. Magellan                     [12] Abanti Basak, Shuangchen Li, Xing Hu, Sang Min Oh, Xinfeng Xie, Li Zhao,
+                                                                                           Xiaowei Jiang, and Yuan Xie. 2019. Analysis and optimization of the memory
+leverages loop behavior to efficiently detect and generate prefetches                      hierarchy for graph processing workloads. In 2019 IEEE International Symposium
+for complex IMA patterns. It increases prefetch opportunities in                           on High Performance Computer Architecture (HPCA). IEEE, 373–386.
+current and future loop iterations by selecting different prefetching                 [13] Scott Beamer, Krste Asanović, and David Patterson. 2015. The GAP benchmark
+                                                                                           suite. arXiv preprint arXiv:1508.03619 (2015).
+strategies based on loop structures. Additionally, Magellan uses                      [14] Rahul Bera, Anant V Nori, Onur Mutlu, and Sreenivas Subramoney. 2019. Dspatch:
+graphs that incorporate induction variables and dependent loads                            Dual spatial pattern prefetcher. In Proceedings of the 52nd Annual IEEE/ACM
+                                                                                           International Symposium on Microarchitecture. 531–544.
+from multiple levels of nested loops to uncover more complex mem-                     [15] Nathan Binkert, Bradford Beckmann, Gabriel Black, Steven K Reinhardt, Ali
+ory access patterns. These innovations enable Magellan to achieve                          Saidi, Arkaprava Basu, Joel Hestness, Derek R Hower, Tushar Krishna, Somayeh
+significant performance speedups across various applications and                           Sardashti, et al. 2011. The gem5 simulator. ACM SIGARCH computer architecture
+                                                                                           news 39, 2 (2011), 1–7.
+datasets. Thus, Magellan offers a high-performance and practical                      [16] Paolo Boldi and Sebastiano Vigna. 2004. The webgraph framework I: compression
+solution to alleviate memory bottlenecks.                                                  techniques. In Proceedings of the 13th international conference on World Wide Web.
+                                                                                 13
+
+
+
+
+                                                                             613
+ISCA ’25, June 21–25, 2025, Tokyo, Japan                                                         Gelin Fu, Tian Xia, Mingzhuo Yin, Prashant J. Nair, Mieszko Lis, and Pengju Ren
+
+
+     595–602.                                                                                      computer. In Proceedings of the 42nd annual international symposium on computer
+[17] Adam L. Buchsbaum, Loukas Georgiadis, Haim Kaplan, Anne Rogers, Robert E.                     architecture. 158–169.
+     Tarjan, and Jeffery R. Westbrook. 2008. Linear-Time Algorithms for Domina-               [40] Magnus Karlsson, Fredrik Dahlgren, and Per Stenstrom. 2000. A prefetching
+     tors and Other Path-Evaluation Problems. SIAM J. Comput. 38, 4 (Nov. 2008),                   technique for irregular accesses to linked data structures. In Proceedings Sixth
+     1533–1573. doi:10.1137/070693217                                                              International Symposium on High-Performance Computer Architecture. HPCA-6
+[18] Aydin Buluc and John R Gilbert. 2008. On the representation and multiplication                (Cat. No. PR00550). IEEE, 206–217.
+     of hypersparse matrices. In 2008 IEEE International Symposium on Parallel and            [41] Jinchun Kim, Seth H Pugsley, Paul V Gratz, AL Narasimha Reddy, Chris Wilkerson,
+     Distributed Processing. IEEE, 1–11.                                                           and Zeshan Chishti. 2016. Path confidence based lookahead prefetching. In 2016
+[19] Shimin Chen, Anastassia Ailamaki, Phillip B Gibbons, and Todd C Mowry. 2007.                  49th Annual IEEE/ACM International Symposium on Microarchitecture (MICRO).
+     Improving hash join performance through prefetching. ACM Transactions on                      IEEE, 1–12.
+     Database Systems (TODS) 32, 3 (2007), 17–es.                                             [42] Thomas N Kipf and Max Welling. 2016. Semi-supervised classification with graph
+[20] Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin Zheng, Eddie Yan, Haichen                  convolutional networks. arXiv preprint arXiv:1609.02907 (2016).
+     Shen, Meghan Cowan, Leyuan Wang, Yuwei Hu, Luis Ceze, et al. 2018. { TVM } :             [43] Onur Kocberber, Boris Grot, Javier Picorel, Babak Falsafi, Kevin Lim, and
+     An automated { End-to-End } optimizing compiler for deep learning. In 13th                    Parthasarathy Ranganathan. 2013. Meet the walkers: Accelerating index tra-
+     USENIX Symposium on Operating Systems Design and Implementation (OSDI 18).                    versals for in-memory databases. In Proceedings of the 46th Annual IEEE/ACM
+     578–594.                                                                                      International Symposium on Microarchitecture. 468–479.
+[21] Tien-Fu Chen and Jean-Loup Baer. 1995. Effective hardware-based data prefetch-           [44] Paul Kocher, Jann Horn, Anders Fogh, Daniel Genkin, Daniel Gruss, Werner Haas,
+     ing for high-performance processors. IEEE transactions on computers 44, 5 (1995),             Mike Hamburg, Moritz Lipp, Stefan Mangard, Thomas Prescher, Michael Schwarz,
+     609–623.                                                                                      and Yuval Yarom. 2019. Spectre Attacks: Exploiting Speculative Execution. In 2019
+[22] Jamison Collins, Suleyman Sair, Brad Calder, and Dean M Tullsen. 2002. Pointer                IEEE Symposium on Security and Privacy (SP). 1–19. doi:10.1109/SP.2019.00002
+     cache assisted prefetching. In Proceedings of the 35th annual ACM/IEEE interna-          [45] Chris Lattner and Vikram Adve. 2004. LLVM: A compilation framework for
+     tional symposium on Microarchitecture. 62–73.                                                 lifelong program analysis & transformation. In International symposium on code
+[23] JD Collins, Hong Wang, DM Tullsen, C Hughes, Yong-Fong Lee, D Lavery, and                     generation and optimization, 2004. CGO 2004. IEEE, 75–86.
+     JP Shen. 2001. Speculative precomputation: long-range prefetching of delin-              [46] Jure Leskovec and Rok Sosič. 2016. Snap: A general-purpose network analysis and
+     quent loads. In Proceedings of 28th Annual International Symposium on Computer                graph-mining library. ACM Transactions on Intelligent Systems and Technology
+     Architecture. IEEE Computer Society, 14–25.                                                   (TIST) 8, 1 (2016), 1–20.
+[24] Timothy A Davis and Yifan Hu. 2011. The University of Florida sparse matrix              [47] Moritz Lipp, Daniel Gruss, and Michael Schwarz. 2022. { AMD } prefetch attacks
+     collection. ACM Transactions on Mathematical Software (TOMS) 38, 1 (2011),                    through power and time. In 31st USENIX Security Symposium (USENIX Security
+     1–25.                                                                                         22). 643–660.
+[25] Jack Dongarra, Michael A Heroux, and Piotr Luszczek. 2015. HPCG benchmark:               [48] Fangfei Liu, Yuval Yarom, Qian Ge, Gernot Heiser, and Ruby B. Lee. 2015. Last-
+     a new metric for ranking high performance computing systems. Knoxville,                       Level Cache Side-Channel Attacks are Practical. In 2015 IEEE Symposium on
+     Tennessee 42 (2015).                                                                          Security and Privacy. 605–622. doi:10.1109/SP.2015.43
+[26] Jack Doweck, Wen-Fu Kao, Allen Kuan-yu Lu, Julius Mandelblat, Anirudha                   [49] Chi-Keung Luk and Todd C Mowry. 1996. Compiler-based prefetching for re-
+     Rahatekar, Lihu Rappoport, Efraim Rotem, Ahmad Yasin, and Adi Yoaz. 2017.                     cursive data structures. In Proceedings of the seventh international conference on
+     Inside 6th-generation intel core: New microarchitecture code-named skylake.                   Architectural support for programming languages and operating systems. 222–233.
+     IEEE Micro 37, 2 (2017), 52–62.                                                          [50] Andrew Lumsdaine, Douglas Gregor, Bruce Hendrickson, and Jonathan Berry.
+[27] Babak Falsafi and Thomas F Wenisch. 2022. A primer on hardware prefetching.                   2007. Challenges in parallel graph processing. Parallel Processing Letters 17, 01
+     Springer Nature.                                                                              (2007), 5–20.
+[28] Yu Feng, Gunnar Hammonds, Yiming Gan, and Yuhao Zhu. 2022. Crescent:                     [51] Piotr Luszczek, Jack J Dongarra, David Koester, Rolf Rabenseifner, Bob Lucas,
+     taming memory irregularities for accelerating deep point cloud analytics. In                  Jeremy Kepner, John McCalpin, David Bailey, and Daisuke Takahashi. 2005.
+     Proceedings of the 49th Annual International Symposium on Computer Architecture.              Introduction to the HPC challenge benchmark suite. (2005).
+     962–977.                                                                                 [52] Pierre Michaud. 2016. Best-offset hardware prefetching. In 2016 IEEE International
+[29] Gelin Fu, Tian Xia, Zhongpei Luo, Ruiyang Chen, Wenzhe Zhao, and Pengju Ren.                  Symposium on High Performance Computer Architecture (HPCA). IEEE, 469–480.
+     2024. Differential-Matching Prefetcher for Indirect Memory Access. In 2024 IEEE          [53] Alan Mislove, Massimiliano Marcon, Krishna P Gummadi, Peter Druschel, and
+     International Symposium on High-Performance Computer Architecture (HPCA).                     Bobby Bhattacharjee. 2007. Measurement and analysis of online social networks.
+     IEEE, 439–453.                                                                                In Proceedings of the 7th ACM SIGCOMM conference on Internet measurement.
+[30] Daniel Gruss, Clémentine Maurice, Anders Fogh, Moritz Lipp, and Stefan Man-                   29–42.
+     gard. 2016. Prefetch side-channel attacks: Bypassing SMAP and kernel ASLR. In            [54] Todd C Mowry, Monica S Lam, and Anoop Gupta. 1992. Design and evaluation
+     Proceedings of the 2016 ACM SIGSAC conference on computer and communications                  of a compiler algorithm for prefetching. ACM Sigplan Notices 27, 9 (1992), 62–73.
+     security. 368–379.                                                                       [55] Anurag Mukkara, Nathan Beckmann, Maleen Abeydeera, Xiaosong Ma, and
+[31] Wim Heirman, Kristof Du Bois, Yves Vandriessche, Stijn Eyerman, and Ibrahim                   Daniel Sanchez. 2018. Exploiting locality in graph analytics through hardware-
+     Hur. 2018. Near-side prefetch throttling: Adaptive prefetching for high-                      accelerated traversal scheduling. In 2018 51st Annual IEEE/ACM International
+     performance many-core processors. In Proceedings of the 27th International Con-               Symposium on Microarchitecture (MICRO). IEEE, 1–14.
+     ference on Parallel Architectures and Compilation Techniques. 1–11.                      [56] Anurag Mukkara, Nathan Beckmann, and Daniel Sanchez. 2019. PHI: Architec-
+[32] John L Henning. 2006. SPEC CPU2006 benchmark descriptions. ACM SIGARCH                        tural support for synchronization-and bandwidth-efficient commutative scatter
+     Computer Architecture News 34, 4 (2006), 1–17.                                                updates. In Proceedings of the 52nd Annual IEEE/ACM International Symposium
+[33] Mathé Hertogh, Sander Wiebing, and Cristiano Giuffrida. 2024. Leaky Address                   on Microarchitecture. 1009–1022.
+     Masking: Exploiting Unmasked Spectre Gadgets with Noncanonical Address                   [57] Onur Mutlu, Jared Stark, Chris Wilkerson, and Yale N Patt. 2003. Runahead
+     Translation. In 2024 IEEE Symposium on Security and Privacy (SP). 3773–3788.                  execution: An alternative to very large instruction windows for out-of-order
+     doi:10.1109/SP54263.2024.00158                                                                processors. In The Ninth International Symposium on High-Performance Computer
+[34] Torsten Hoefler, Dan Alistarh, Tal Ben-Nun, Nikoli Dryden, and Alexandra Peste.               Architecture, 2003. HPCA-9 2003. Proceedings. IEEE, 129–140.
+     2021. Sparsity in deep learning: Pruning and growth for efficient inference and          [58] Lifeng Nai, Yinglong Xia, Ilie G Tanase, Hyesoon Kim, and Ching-Yung Lin. 2015.
+     training in neural networks. Journal of Machine Learning Research 22, 241 (2021),             GraphBIG: understanding graph computing in the context of industrial solutions.
+     1–124.                                                                                        In Proceedings of the International Conference for High Performance Computing,
+[35] Tatsushi Inagaki, Tamiya Onodera, Hideaki Komatsu, and Toshio Nakatani. 2003.                 Networking, Storage and Analysis. 1–12.
+     Stride prefetching by dynamically inspecting objects. ACM SIGPLAN Notices 38,            [59] Ajeya Naithani, Sam Ainsworth, Timothy M Jones, and Lieven Eeckhout. 2021.
+     5 (2003), 269–277.                                                                            Vector runahead. In 2021 ACM/IEEE 48th Annual International Symposium on
+[36] Intel® 64 and IA-32 Architectures Optimization Reference Manual. [n. d.].                     Computer Architecture (ISCA). IEEE, 195–208.
+     https://www.intel.com/content/www/us/en/content-details/671488/intel-64-                 [60] Ajeya Naithani, Jaime Roelandts, Sam Ainsworth, Timothy M Jones, and Lieven
+     and-ia-32-architectures-optimization-reference-manual.html.                                   Eeckhout. 2023. Decoupled vector runahead. In Proceedings of the 56th Annual
+[37] Akanksha Jain and Calvin Lin. 2013. Linearizing irregular memory accesses for                 IEEE/ACM International Symposium on Microarchitecture. 17–31.
+     improved correlated prefetching. In Proceedings of the 46th Annual IEEE/ACM              [61] Agustín Navarro-Torres, Biswabandan Panda, Jesús Alastruey-Benedé, Pablo
+     International Symposium on Microarchitecture. 247–259.                                        Ibáñez, Víctor Viñals-Yúfera, and Alberto Ros. 2022. Berti: an accurate local-delta
+[38] Saba Jamilan, Tanvir Ahmed Khan, Grant Ayers, Baris Kasikci, and Heiner Litz.                 data prefetcher. In 2022 55th IEEE/ACM International Symposium on Microarchi-
+     2022. Apt-get: Profile-guided timely software prefetching. In Proceedings of the              tecture (MICRO). IEEE, 975–991.
+     Seventeenth European Conference on Computer Systems. 747–764.                            [62] Nicholas Nethercote and Julian Seward. 2007. Valgrind: a framework for heavy-
+[39] Svilen Kanev, Juan Pablo Darago, Kim Hazelwood, Parthasarathy Ranganathan,                    weight dynamic binary instrumentation. ACM Sigplan notices 42, 6 (2007), 89–100.
+     Tipp Moseley, Gu-Yeon Wei, and David Brooks. 2015. Profiling a warehouse-scale
+                                                                                         14
+
+
+
+
+                                                                                     614
+Magellan: A High-Performance Loop-Guided Prefetcher for Indirect Memory Access                                                             ISCA ’25, June 21–25, 2025, Tokyo, Japan
+
+
+[63] Quan M Nguyen and Daniel Sanchez. 2020. Pipette: Improving core utilization                [84] Xiangyao Yu, Christopher J Hughes, Nadathur Satish, and Srinivas Devadas.
+     on irregular applications through intra-core pipeline parallelism. In 2020 53rd                 2015. IMP: Indirect memory prefetcher. In Proceedings of the 48th International
+     Annual IEEE/ACM International Symposium on Microarchitecture (MICRO). IEEE,                     Symposium on Microarchitecture. 178–190.
+     596–608.                                                                                   [85] Yuxuan Zhang, Nathan Sobotka, Soyoon Park, Saba Jamilan, Tanvir Ahmed
+[64] Quan M Nguyen and Daniel Sanchez. 2023. Phloem: Automatic acceleration of                       Khan, Baris Kasikci, Gilles A Pokam, Heiner Litz, and Joseph Devietti. 2024.
+     irregular applications with fine-grain pipeline parallelism. In 2023 IEEE Inter-                RPG2: Robust Profile-Guided Runtime Prefetch Generation. In Proceedings of
+     national Symposium on High-Performance Computer Architecture (HPCA). IEEE,                      the 29th ACM International Conference on Architectural Support for Programming
+     1262–1274.                                                                                      Languages and Operating Systems, Volume 2. 999–1013.
+[65] Intel® oneAPI Programming Guide. 2024. https://www.intel.com/content/www/
+     us/en/developer/tools/oneapi/toolkits.html.
+[66] Samuel Pakalapati and Biswabandan Panda. 2020. Bouquet of instruction point-
+     ers: Instruction pointer classifier-based spatial hardware prefetching. In 2020
+     ACM/IEEE 47th Annual International Symposium on Computer Architecture (ISCA).
+     IEEE, 118–131.
+[67] Maksim Panchenko, Rafael Auler, Bill Nell, and Guilherme Ottoni. 2019. Bolt:
+     a practical binary optimizer for data centers and beyond. In 2019 IEEE/ACM
+     International Symposium on Code Generation and Optimization (CGO). IEEE, 2–
+     14.
+[68] Leeor Peled, Shie Mannor, Uri Weiser, and Yoav Etsion. 2015. Semantic locality
+     and context-based prefetching using reinforcement learning. In Proceedings of
+     the 42nd Annual International Symposium on Computer Architecture. 285–297.
+[69] Shafiur Rahman, Nael Abu-Ghazaleh, and Rajiv Gupta. 2020. Graphpulse: An
+     event-driven hardware accelerator for asynchronous graph processing. In 2020
+     53rd Annual IEEE/ACM International Symposium on Microarchitecture (MICRO).
+     IEEE, 908–921.
+[70] Shafiur Rahman, Mahbod Afarin, Nael Abu-Ghazaleh, and Rajiv Gupta. 2021.
+     Jetstream: Graph analytics on streaming data with event-driven hardware accel-
+     erator. In MICRO-54: 54th Annual IEEE/ACM International Symposium on Microar-
+     chitecture. 1091–1105.
+[71] Amir Roth and Gurindar S Sohi. 1999. Effective jump-pointer prefetching for
+     linked data structures. In Proceedings of the 26th annual international symposium
+     on Computer architecture. 111–121.
+[72] David Sehr, Robert Muth, Cliff Biffle, Victor Khimenko, Egor Pasko, Karl Schimpf,
+     Bennet Yee, and Brad Chen. 2010. Adapting Software Fault Isolation to Con-
+     temporary { CPU } Architectures. In 19th USENIX Security Symposium (USENIX
+     Security 10).
+[73] Alan Jay Smith. 1978. Sequential program prefetching in memory hierarchies.
+     Computer 11, 12 (1978), 7–21.
+[74] Bjarne Steensgaard. 1996. Points-to analysis in almost linear time. In Proceedings
+     of the 23rd ACM SIGPLAN-SIGACT Symposium on Principles of Programming
+     Languages (St. Petersburg Beach, Florida, USA) (POPL ’96). Association for Com-
+     puting Machinery, New York, NY, USA, 32–41. doi:10.1145/237721.237727
+[75] Nishil Talati, Kyle May, Armand Behroozi, Yichen Yang, Kuba Kaszyk, Christos
+     Vasiladiotis, Tarunesh Verma, Lu Li, Brandon Nguyen, Jiawen Sun, Agreen Ah-
+     madi, Todd Austin, Michael O’Boyle, Scott Mahlke, Trevor Mudge, and Ronald
+     Dreslinski. 2021. Prodigy: Improving the memory latency of data-indirect irreg-
+     ular workloads using hardware-software co-design. In 2021 IEEE International
+     Symposium on High-Performance Computer Architecture (HPCA). IEEE, 654–667.
+[76] Gang Tan et al. 2017. Principles and implementation techniques of software-
+     based fault isolation. Foundations and Trends® in Privacy and Security 1, 3 (2017),
+     137–198.
+[77] Robert Wahbe, Steven Lucco, Thomas E Anderson, and Susan L Graham. 1993.
+     Efficient software-based fault isolation. In Proceedings of the fourteenth ACM
+     symposium on Operating systems principles. 203–216.
+[78] Hao Wu, Krishnendra Nathella, Joseph Pusdesris, Dam Sunwoo, Akanksha Jain,
+     and Calvin Lin. 2019. Temporal prefetching without the off-chip metadata. In
+     Proceedings of the 52nd Annual IEEE/ACM International Symposium on Microar-
+     chitecture. 996–1008.
+[79] Hao Wu, Krishnendra Nathella, Dam Sunwoo, Akanksha Jain, and Calvin Lin.
+     2019. Efficient metadata management for irregular data prefetching. In Proceed-
+     ings of the 46th International Symposium on Computer Architecture. 449–461.
+[80] Youfeng Wu. 2002. Efficient discovery of regular stride patterns in irregular
+     programs and its use in compiler prefetching. In Proceedings of the ACM SIGPLAN
+     2002 Conference on Programming language design and implementation. 210–221.
+[81] Tian Xia, Gelin Fu, Chenyang Li, Zhongpei Luo, Lucheng Zhang, Ruiyang Chen,
+     Wenzhe Zhao, Nanning Zheng, and Pengju Ren. 2022. A comprehensive perfor-
+     mance model of sparse matrix-vector multiplication to guide kernel optimization.
+     IEEE Transactions on Parallel and Distributed Systems 34, 2 (2022), 519–534.
+[82] Feng Xue, Chenji Han, Xinyu Li, Junliang Wu, Tingting Zhang, Tianyi Liu, Yifan
+     Hao, Zidong Du, Qi Guo, and Fuxin Zhang. 2024. Tyche: An Efficient and General
+     Prefetcher for Indirect Memory Accesses. ACM Transactions on Architecture and
+     Code Optimization 21, 2 (2024), 1–26.
+[83] Yuval Yarom and Katrina Falkner. 2014. FLUSH+RELOAD: A High Reso-
+     lution, Low Noise, L3 Cache Side-Channel Attack. In 23rd USENIX Security
+     Symposium (USENIX Security 14). USENIX Association, San Diego, CA, 719–
+     732. https://www.usenix.org/conference/usenixsecurity14/technical-sessions/
+     presentation/yarom
+
+                                                                                           15
+
+
+
+
+                                                                                       615
+
