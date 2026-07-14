@@ -76,3 +76,19 @@ measurements trustworthy. **Still not ready to bulk-replace
 window) but two of the four clean PCs carry large sample sizes (~9,500
 each) at an 18.3% waste rate — real, corroborating data inside the
 analytical model's predicted range.
+
+## Phase 3: calibration cross-check
+
+See `PHASE3_RESULTS.md`. Compared ChampSim's own simulated total DRAM
+bandwidth overhead (`loop_guided` vs. `no`-prefetcher baseline) against
+Magellan's own reported ~10% overhead. Measured overhead is far lower
+(0.002% at the current distance=1 setting, 0.031% at the more aggressive
+distance=4) — traced to an exact mechanism (prefetch misses at LLC almost
+perfectly substitute for, rather than add to, demand-load misses), not an
+artifact. Doesn't contradict Phase 2's 18.3% waste finding: that measures a
+proxy for wrong-path waste in a hypothetical deep-ROB machine, while this
+measures actual bandwidth in the only world ChampSim can simulate
+(always-correct-path) — complementary numbers, not competing ones. No red
+flag, but the gap is large enough that this prefetcher/workload shouldn't
+be treated as bandwidth-representative of a tuned production prefetcher —
+a caveat carried into Phase 4, not resolved here.
