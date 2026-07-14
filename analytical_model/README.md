@@ -8,6 +8,8 @@ proactive, per-branch reconvergence-gated mechanism?**
 ## Files
 
 - `model.py` — the model. Run with `python3 model.py`.
+- `FINDINGS.md` — the actual captured output tables and their interpretation
+  (durable record; `model.py`'s printed output otherwise just scrolls away).
 - `spike_v1/` — the original exploratory spike and its independent audit.
   Kept for provenance. Two problems the audit found in it motivated this
   version: an unanchored bandwidth number that came out ~4x larger than
