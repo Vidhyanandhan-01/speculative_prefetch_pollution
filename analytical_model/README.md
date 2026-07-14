@@ -10,6 +10,11 @@ proactive, per-branch reconvergence-gated mechanism?**
 - `model.py` — the model. Run with `python3 model.py`.
 - `FINDINGS.md` — the actual captured output tables and their interpretation
   (durable record; `model.py`'s printed output otherwise just scrolls away).
+- `phase4_empirical_calibration.py` / `PHASE4_RESULTS.md` — feeds real
+  ChampSim-measured data (Phase 2 v4 + Phase 3) into this model's own
+  functions in place of the swept assumptions, and checks whether the
+  composed prediction survives. It does (see PHASE4_RESULTS.md) — real data
+  lands inside the range predicted from swept assumptions alone.
 - `spike_v1/` — the original exploratory spike and its independent audit.
   Kept for provenance. Two problems the audit found in it motivated this
   version: an unanchored bandwidth number that came out ~4x larger than
@@ -55,17 +60,18 @@ the highest-leverage unknown — this is the first thing a ChampSim pass
 should measure directly (a control-dependence tracker on prefetched loads)
 rather than continue to sweep as an assumption.
 
-## Next step: ChampSim
+## Status: Phases 0-4 done, mechanism (Phase 5) not started
 
-This model motivates instrumenting, in order:
+All three ChampSim-instrumentation items this README used to list as "next"
+are done: `champsim_custom/prefetcher/loop_guided` measures real
+`gating_branches` and per-PC waste (Phase 2, through 4 rounds of fixes —
+see `champsim_custom/PHASE2_RESULTS.md`), a real channel-bandwidth
+cross-check against Magellan's own measurement was run (Phase 3 —
+`champsim_custom/PHASE3_RESULTS.md`), and that real data has been fed back
+into this model in place of the swept assumptions (Phase 4 — this
+directory's `PHASE4_RESULTS.md`). The composed prediction survived.
 
-1. A control-dependence tracker to measure real `gating_branches`
-   distributions on prefetch-eligible loads (highest sensitivity).
-2. A per-PC prefetch-outcome histogram to measure real Zipf `alpha`
-   (second-highest sensitivity) instead of assuming a concentration.
-3. Channel-bandwidth breakdown by request type, to replace the Magellan-
-   anchored overhead assumption with a workload-specific measurement.
-
-Only once real distributions replace these three swept assumptions is it
-worth building the actual reconvergence-gated throttling mechanism in
-`champsim_custom/prefetcher/`.
+What hasn't been done: validation beyond a single workload (mcf) and a
+short (5M-instruction) window, and the actual reconvergence-gated
+throttling mechanism itself (Phase 5) — gated on broader validation, not
+started.
