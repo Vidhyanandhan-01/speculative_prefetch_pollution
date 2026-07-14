@@ -18,6 +18,9 @@ results/*
 *.champsim.trace*
 *.trace.xz
 
+# Analytical model outputs (regenerable via model.py)
+analytical_model/output/
+
 # OS / editor cruft
 .DS_Store
 *.swp

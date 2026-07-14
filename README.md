@@ -9,8 +9,10 @@ misprediction is caught.
 
 - `literature_survey/` — survey notes, problem statement, and source papers
   (`papers/`) underpinning the idea.
-- `analytical_model/` — early back-of-envelope validation model and audit,
-  used to sanity-check the idea before committing to simulation.
+- `analytical_model/` — calibrated back-of-envelope model (`model.py`) used
+  to size the effect and identify what to instrument in ChampSim first,
+  before committing to simulation. `spike_v1/` holds the earlier exploratory
+  version and its audit, kept for provenance.
 - `champsim/` — ChampSim simulator (git submodule) plus any custom
   prefetcher/branch-predictor modules implementing this idea.
 - `proposal/` — the written project proposal.
