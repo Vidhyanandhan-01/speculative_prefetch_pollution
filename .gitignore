@@ -15,6 +15,9 @@ champsim/*.o
 # Results / traces (large, regenerable)
 results/*
 !results/.gitkeep
+!results/traces/
+results/traces/*
+!results/traces/README.md
 *.champsim.trace*
 *.trace.xz
 
