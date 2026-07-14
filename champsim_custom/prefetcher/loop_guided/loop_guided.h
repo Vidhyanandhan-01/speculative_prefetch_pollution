@@ -2,13 +2,17 @@
 #define LOOP_GUIDED_H
 
 #include <cstdint>
+#include <deque>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "address.h"
 #include "champsim.h"
 #include "modules.h"
 #include "msl/lru_table.h"
+
+#include "../../instrumentation/branch_log.h"
 
 /*
  * Simplified, Magellan-inspired ("loop-guided") software-prefetcher proxy.
@@ -33,6 +37,16 @@
  * period=1 degenerates to a constant stride (already covered by ip_stride);
  * this module's interesting cases are period>=2, which ip_stride cannot
  * detect at all since it only ever tracks a single last-stride value.
+ *
+ * Phase 2 instrumentation (see instrumentation/branch_log.h): every issued
+ * prefetch's branch_log sequence number is recorded per source PC; the next
+ * real occurrence of that PC pops the oldest pending sequence number and
+ * measures (a) how many conditional/other branches retired in between --
+ * an empirical gating_branches sample -- and (b) whether any of them
+ * mispredicted -- the "this prefetch would have been wasted on a wrong
+ * path" proxy, aggregated per PC for an empirical waste-concentration
+ * (alpha) measurement. Replaces the two swept assumptions in
+ * analytical_model/model.py with real data from this workload.
  */
 struct loop_guided : public champsim::modules::prefetcher {
   constexpr static std::size_t TRACKER_SETS = 256;
@@ -61,16 +75,27 @@ struct loop_guided : public champsim::modules::prefetcher {
   };
 
   struct lookahead_entry {
+    champsim::address owner_ip{}; // which tracked PC this lookahead belongs to
     champsim::address last_address{};
     std::vector<champsim::block_number::difference_type> period_deltas;
     std::size_t next_delta_idx = 0;
     int iters_remaining = 0;
   };
 
+  constexpr static std::size_t PENDING_QUEUE_CAP = 64; // bound memory if issues outpace real occurrences
+  constexpr static unsigned GATING_HISTOGRAM_CAP = 32; // bucket anything >= this into one overflow bucket
+
   champsim::msl::lru_table<tracker_entry> table{TRACKER_SETS, TRACKER_WAYS};
   std::optional<lookahead_entry> active_lookahead;
 
+  // Phase 2 instrumentation state, keyed by source PC's raw address value.
+  std::unordered_map<uint64_t, std::deque<uint64_t>> pending_issue_seqs;
+  std::unordered_map<uint64_t, uint64_t> per_pc_total;
+  std::unordered_map<uint64_t, uint64_t> per_pc_wasted;
+  std::unordered_map<unsigned, uint64_t> gating_branches_histogram;
+
   static std::optional<unsigned> detect_period(const std::vector<champsim::block_number::difference_type>& hist);
+  void record_prefetch_outcome(uint64_t ip_key, uint64_t use_seq);
 
 public:
   using champsim::modules::prefetcher::prefetcher;
@@ -79,6 +104,7 @@ public:
                                     uint32_t metadata_in);
   uint32_t prefetcher_cache_fill(champsim::address addr, long set, long way, uint8_t prefetch, champsim::address evicted_addr, uint32_t metadata_in);
   void prefetcher_cycle_operate();
+  void prefetcher_final_stats();
 };
 
 #endif

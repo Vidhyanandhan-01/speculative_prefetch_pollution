@@ -1,6 +1,34 @@
 #include "loop_guided.h"
 
+#include <algorithm>
+#include <fstream>
+
+#include <fmt/core.h>
+
 #include "cache.h"
+
+void loop_guided::record_prefetch_outcome(uint64_t ip_key, uint64_t use_seq)
+{
+  auto queue_it = pending_issue_seqs.find(ip_key);
+  if (queue_it == pending_issue_seqs.end() || queue_it->second.empty())
+    return; // no outstanding prefetch was issued for this PC to close out
+
+  uint64_t issue_seq = queue_it->second.front();
+  queue_it->second.pop_front();
+
+  if (use_seq < issue_seq)
+    return; // defensive: shouldn't happen, but don't underflow if it does
+
+  auto gating_branches = use_seq - issue_seq;
+  bool wasted = speculative_pollution::any_mispredicted_in_range(issue_seq, use_seq);
+
+  per_pc_total[ip_key] += 1;
+  if (wasted)
+    per_pc_wasted[ip_key] += 1;
+
+  unsigned bucket = static_cast<unsigned>(std::min<uint64_t>(gating_branches, GATING_HISTOGRAM_CAP));
+  gating_branches_histogram[bucket] += 1;
+}
 
 std::optional<unsigned> loop_guided::detect_period(const std::vector<champsim::block_number::difference_type>& hist)
 {
@@ -29,6 +57,10 @@ uint32_t loop_guided::prefetcher_cache_operate(champsim::address addr, champsim:
   champsim::block_number cl_addr{addr};
   auto found = table.check_hit(tracker_entry{ip});
 
+  // Phase 2 instrumentation: this real access is the "use" for whichever
+  // pending prefetch was issued furthest in the past for this PC, if any.
+  record_prefetch_outcome(ip.to<uint64_t>(), speculative_pollution::current_seq());
+
   tracker_entry entry = found.has_value() ? *found : tracker_entry{ip};
 
   if (found.has_value()) {
@@ -42,7 +74,7 @@ uint32_t loop_guided::prefetcher_cache_operate(champsim::address addr, champsim:
       if (period.has_value()) {
         entry.locked_period = *period;
         std::vector<champsim::block_number::difference_type> cycle(entry.history.end() - static_cast<long>(*period), entry.history.end());
-        active_lookahead = lookahead_entry{champsim::address{cl_addr}, std::move(cycle), 0, PREFETCH_DISTANCE_ITERS * static_cast<int>(*period)};
+        active_lookahead = lookahead_entry{ip, champsim::address{cl_addr}, std::move(cycle), 0, PREFETCH_DISTANCE_ITERS * static_cast<int>(*period)};
       }
     }
   }
@@ -74,6 +106,14 @@ void loop_guided::prefetcher_cycle_operate()
       la.last_address = pf_address;
       la.next_delta_idx = (la.next_delta_idx + 1) % la.period_deltas.size();
       la.iters_remaining -= 1;
+
+      // Phase 2 instrumentation: record this issue's branch_log position so
+      // a future real occurrence of la.owner_ip can measure how many
+      // conditional/other branches intervened and whether any mispredicted.
+      auto& pending = pending_issue_seqs[la.owner_ip.to<uint64_t>()];
+      pending.push_back(speculative_pollution::current_seq());
+      if (pending.size() > PENDING_QUEUE_CAP)
+        pending.pop_front();
     }
     // if the request was rejected (e.g. PQ full), try again next cycle without advancing
   } else {
@@ -85,4 +125,29 @@ uint32_t loop_guided::prefetcher_cache_fill(champsim::address addr, long set, lo
                                             uint32_t metadata_in)
 {
   return metadata_in;
+}
+
+void loop_guided::prefetcher_final_stats()
+{
+  // Phase 2 instrumentation dump: replaces analytical_model/model.py's swept
+  // gating_branches and alpha assumptions with empirical measurements from
+  // this run. Written to the current working directory -- run champsim from
+  // wherever you want these to land.
+  {
+    std::ofstream out("pf_per_pc_waste.csv");
+    out << "pc_hex,total,wasted,wasted_fraction\n";
+    for (const auto& [ip_key, total] : per_pc_total) {
+      auto wasted_it = per_pc_wasted.find(ip_key);
+      uint64_t wasted = (wasted_it != per_pc_wasted.end()) ? wasted_it->second : 0;
+      double wasted_fraction = total > 0 ? static_cast<double>(wasted) / static_cast<double>(total) : 0.0;
+      out << fmt::format("{:#x},{},{},{:.6f}\n", ip_key, total, wasted, wasted_fraction);
+    }
+  }
+  {
+    std::ofstream out("pf_gating_branches_histogram.csv");
+    out << "gating_branches_bucket,count\n";
+    for (const auto& [bucket, count] : gating_branches_histogram) {
+      out << bucket << "," << count << "\n";
+    }
+  }
 }

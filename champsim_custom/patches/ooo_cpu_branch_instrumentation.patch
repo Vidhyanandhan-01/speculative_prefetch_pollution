@@ -1,0 +1,40 @@
+diff --git a/src/ooo_cpu.cc b/src/ooo_cpu.cc
+index 1ac04ff5..d475689a 100644
+--- a/src/ooo_cpu.cc
++++ b/src/ooo_cpu.cc
+@@ -31,6 +31,11 @@
+ #include "instruction.h"
+ #include "util/span.h"
+ 
++// speculative_prefetch_pollution Phase 2 instrumentation (additive; see
++// champsim_custom/instrumentation/branch_log.h for why this is here instead
++// of modeling genuine wrong-path instruction fetch).
++#include "../../champsim_custom/instrumentation/branch_log.h"
++
+ long O3_CPU::operate()
+ {
+   long progress{0};
+@@ -148,9 +153,20 @@ bool O3_CPU::do_predict_branch(ooo_model_instr& arch_instr)
+     // call code prefetcher every time the branch predictor is used
+     l1i->impl_prefetcher_branch_operate(arch_instr.ip, arch_instr.branch, predicted_branch_target);
+ 
+-    if (predicted_branch_target != arch_instr.branch_target
+-        || (((arch_instr.branch == BRANCH_CONDITIONAL) || (arch_instr.branch == BRANCH_OTHER))
+-            && arch_instr.branch_taken != arch_instr.branch_prediction)) { // conditional branches are re-evaluated at decode when the target is computed
++    bool target_mispredicted = predicted_branch_target != arch_instr.branch_target;
++    bool direction_mispredicted =
++        ((arch_instr.branch == BRANCH_CONDITIONAL) || (arch_instr.branch == BRANCH_OTHER)) && arch_instr.branch_taken != arch_instr.branch_prediction;
++
++    // speculative_prefetch_pollution Phase 2 instrumentation: log every
++    // conditional/other branch's real outcome so champsim_custom prefetcher
++    // modules can correlate their own prefetch-issue timing against real
++    // misprediction events (see champsim_custom/instrumentation/branch_log.h).
++    if (!warmup && ((arch_instr.branch == BRANCH_CONDITIONAL) || (arch_instr.branch == BRANCH_OTHER))) {
++      speculative_pollution::record_branch(target_mispredicted || direction_mispredicted);
++    }
++
++    if (target_mispredicted
++        || direction_mispredicted) { // conditional branches are re-evaluated at decode when the target is computed
+       sim_stats.total_rob_occupancy_at_branch_mispredict += std::size(ROB);
+       sim_stats.branch_type_misses.increment(arch_instr.branch);
+       if (!warmup) {
