@@ -1,3 +1,6 @@
 [submodule "champsim"]
 	path = champsim
 	url = https://github.com/ChampSim/ChampSim.git
+[submodule "gem5"]
+	path = gem5
+	url = https://github.com/gem5/gem5.git
